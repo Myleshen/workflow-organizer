@@ -45,8 +45,10 @@ worktrees:
 devx reset
 ```
 
-If the optional Raycast Script Command is installed, reset also offers to remove
-it. The script is otherwise left untouched.
+If the optional Raycast Script Command is installed, reset separately offers to
+remove it. `devx reset --yes` confirms both actions for non-interactive use.
+Symlinked Raycast path components are refused rather than followed, and an
+existing script is revalidated after confirmation before replacement or removal.
 
 The installed binary includes this complete manual, so users do not need the
 repository to learn the workflows:
@@ -95,8 +97,9 @@ child process. `devx` does not continue to later writes after cancellation.
 ## Projects and worktrees
 
 Register scan roots once, then refresh the cached repository list whenever
-repositories or externally-created worktrees change. Clones and worktrees made
-by `devx` refresh the cache automatically.
+repositories or externally-created worktrees change. Clones made by `devx`
+refresh the cache automatically. Worktree creation registers the new worktree
+directly without rescanning the cache.
 
 ```sh
 devx project add-root ~/dev
@@ -218,24 +221,27 @@ Create a new worktree with its branch name:
 devx worktree create my-service feature/login
 ```
 
-The command fetches `origin`, resolves its default branch (`main`, `master`,
-`develop`, or another configured remote default), creates the new branch from
-the current `origin/<default-branch>`, then registers the worktree. Its default
-registry name is `my-service-feature-login`; override it with `--name` when
-needed.
+The command fetches `origin`, resolves its configured remote default branch,
+creates the new branch from the current `origin/<default-branch>`, then
+registers the worktree. Its default registry name is `my-service-feature-login`;
+override it with `--name` when needed.
 
 After creation, `devx` opens the new worktree in the configured editor and
 terminal automatically.
 
 Remove a worktree through the picker with `devx pick` and **Remove worktree**.
-Clean worktrees require one confirmation. Dirty worktrees show a destructive
-force-removal confirmation before their uncommitted changes are discarded. The
-non-interactive equivalent is:
+Direct and picker removal both require confirmation. `--force` permits dirty
+removal but does not bypass confirmation. Non-TTY automation must pass `--yes`:
 
 ```sh
 devx worktree remove my-service-feature-login
 devx worktree remove my-service-feature-login --force
+devx worktree remove my-service-feature-login --force --yes
 ```
+
+After successful interactive removal, `devx` separately offers to delete the
+exact local branch with safe `git branch -d`. Non-TTY removal retains the local
+branch. Remote branches are never changed or offered for deletion.
 
 The new entry gets `template_project = "my-service"` automatically. It shares
 the main project's managed overlays while retaining its own registered name.
@@ -315,8 +321,15 @@ is intentionally limited to one logical `key=value` or `key:value` entry per
 line; escaped separators, escaped keys, and line continuations are not yet
 supported.
 
-`rg` is intentionally not a prerequisite yet. It will be used by a future
-configuration content-search command; project and file selection already use
+Overlay replacement revalidates destination content, file identity, and path
+components after confirmation and before each replacement. It preserves Unix
+permission bits, but not ownership, ACLs, or extended attributes. Staged files
+and containing directories are synchronized around atomic renames. A narrow
+platform-filesystem race remains between final validation and rename because
+the portable Rust filesystem API does not expose directory-relative no-follow
+replacement.
+
+`rg` is required only for `devx config search`; project and file selection use
 the explicit registry and `fzf`.
 
 ## Raycast Shortcut

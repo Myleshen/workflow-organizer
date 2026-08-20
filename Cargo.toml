@@ -8,6 +8,7 @@ anyhow = "1.0.102"
 clap = { version = "4.6.6", features = ["derive"] }
 clap_complete = "4.6.0"
 dialoguer = "0.12.0"
+fs2 = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9"
 similar = "2.7.0"

@@ -2,7 +2,7 @@
 
 ## Document purpose
 
-This document maps the product as reviewed on 2026-08-20. It is intended to let another engineer understand the product surface, architecture, state, workflows, integrations, and test gaps before changing behavior.
+This document preserves the product baseline reviewed on 2026-08-20. Sections explicitly headed "Current implementation update" describe later implementation; all other workflow descriptions are historical review evidence and must not be read as current behavior.
 
 This is a terminal application, not a browser or native graphical application. Its UI consists of Clap command routes and help, `fzf` pickers, `dialoguer` inputs and confirmations, terminal output and diffs, and handoffs to external applications.
 
@@ -69,6 +69,7 @@ The application is synchronous. Commands load the complete TOML configuration, p
 | `similar` | Unified overlay diffs |
 | `anyhow` | Error propagation and context |
 | `tempfile` | Unit-test isolation |
+| `fs2` | Bounded advisory inter-process configuration lock |
 
 External executables include `git`, `fzf`, `rg`, `open`, `brew`, `man`, `tput`, `osascript`, `tmux`, configured editors/terminals, and a configured VCS tool such as LazyGit.
 
@@ -152,6 +153,19 @@ The only evidenced persona is a local developer using Git, a terminal, an editor
 Configured launcher arrays can execute local programs. This is expected local configuration behavior, but it means configuration-file integrity is a security boundary.
 
 ## Workflow map
+
+**Historical baseline:** The workflow descriptions through "Platform coupling and Linux feasibility" capture the original 25-test review baseline. Current behavior differs as summarized below and in `docs/ui-ux-workflow-review.md` under "Second Review Findings and Implementation Handoff".
+
+## Current implementation update
+
+- Destructive project/worktree/reset commands require confirmation, with `--yes` as the non-TTY bypass. Reset applies `--yes` to configuration and Raycast cleanup independently and reports cleanup failure after configuration removal as partial success.
+- Worktree creation registers directly rather than refreshing discovery. A registration-save failure attempts to remove the new Git worktree and branch and reports any residual Git object. Worktree removal reports Git deletion before stale-registration recovery; branch deletion is offered only interactively after state saves.
+- Overlay apply stages the full batch, preserves Unix permission bits, revalidates content, identity, containment, and symlink components after preview, synchronizes staged files/directories, and rolls back completed replacements where possible. Ownership, ACLs, and extended attributes are not preserved. Portable path APIs leave a narrow race between final revalidation and rename.
+- Raycast install/reset reject symlinked parent or final path components, including broken final symlinks, and revalidate file identity and content immediately before mutation.
+- Project/worktree/config pickers preflight empty collections. `project setup` checks projects before requiring `fzf`.
+- Setup saves launcher choices before root collection and saves roots before scanning. Root rename/remove remain direct commands, so F-09 remains partial.
+- Configuration persistence uses adjacent temporary files, atomic rename, file/directory synchronization, and `fs2` locking. The exclusive lock still spans whole config-using commands, so SR-06 remains open.
+- Progress is improved but remains incomplete for native Git output and per-root visibility.
 
 ### First-time initialization
 
@@ -322,6 +336,8 @@ Linux support is a moderate, bounded change rather than an architectural rewrite
 
 ## Documentation inconsistencies
 
+**Historical baseline:** This list described the reviewed pre-implementation state. See the implementation handoff in `docs/ui-ux-workflow-review.md` for changes made afterward and the remaining verification gaps.
+
 1. README and man page say reset offers Raycast removal; implementation does not.
 2. README says worktree creation falls back among `main`, `master`, `develop`, or configured remote default; implementation only accepts `origin/HEAD`.
 3. README documents implemented config search, then later says `rg` is reserved for a future search command.
@@ -330,9 +346,9 @@ Linux support is a moderate, bounded change rather than an architectural rewrite
 
 ## Test strategy and observed checks
 
-Twenty-five unit tests currently cover state serialization, path safety, naming, collision behavior, selected YAML/properties logic, overlay creation, cached projects, app discovery helpers, picker row formatting, dirty fallback, search path construction, and workspace defaults/quoting.
+The original review baseline had 25 unit tests. The F-01 through F-09 implementation handoff recorded 30 passing tests. The current source has 35 tests, adding focused stale-content, symlink-component, durability, and Git rollback coverage.
 
-Checks run during review:
+Checks run during the original review:
 
 - `cargo test`: 25 passed
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
@@ -343,6 +359,8 @@ Checks run during review:
 - Empty isolated `devx project list`: produced no output
 
 Missing coverage includes complete CLI scenarios, real Git repositories/worktrees, interactive picker behavior, prompt cancellation, Raycast lifecycle, launcher handoffs, clone URL variants, concurrency, partial failure/rollback, permissions, accessibility, terminal-width matrices, large project collections, Linux, and documentation consistency.
+
+Source line references in the original review findings are historical pointers to the reviewed baseline. Function names remain the durable references; inspect current source for present line numbers.
 
 ## Unknowns requiring explicit product decisions
 

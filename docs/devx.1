@@ -40,8 +40,9 @@ Setup recommends Ghostty, Zed, and LazyGit when absent, but does not install
 them. LazyGit is required only when the workspace workflow is enabled.
 .PP
 Register directories containing repositories, then refresh the cached list when
-repositories or externally-created worktrees change. Clones and worktrees made
-by devx refresh the cache automatically.
+repositories or externally-created worktrees change. Clones made by devx
+refresh the cache automatically. Worktree creation registers the new worktree
+directly without rescanning the cache.
 .PP
 .EX
 devx project add-root ~/dev
@@ -58,7 +59,9 @@ Print the configured launcher commands.
 .B devx reset
 After confirmation, remove all devx configuration and overlays. Repositories
 and Git worktrees are never changed. If installed, the Raycast script can also
-be removed.
+be removed. --yes confirms both removals for non-interactive use. Symlinked
+Raycast path components are refused, and an existing script is revalidated
+after confirmation before replacement or removal.
 .SH DIAGNOSTICS AND COMPLETIONS
 .B devx doctor
 checks Git, fzf, configured applications, local configuration, and the Raycast
@@ -85,7 +88,15 @@ Refresh the cached repository and worktree list from all registered scan roots.
 List registered and discovered repositories and worktrees.
 .TP
 .B devx project remove NAME
-Remove an explicitly registered project. It does not delete files.
+After confirmation, unregister an explicitly registered project. It does not
+delete checkout files. Use --yes only for non-interactive automation.
+.TP
+.B devx project rename-root NAME NEW_NAME
+Rename a configured scan root without scanning repositories.
+.TP
+.B devx project remove-root NAME
+After confirmation, remove a scan root from devx state and refresh its cache.
+Repositories are not deleted. Use --yes only for non-interactive automation.
 .TP
 .B devx project clone ROOT URL
 Clone a repository beneath a named scan root without opening applications.
@@ -123,10 +134,12 @@ Existing worktrees are discovered with Git and are not moved. New worktrees
 share their primary project's configuration overlays and open in the configured
 editor and terminal after creation.
 .PP
-Use devx pick and choose Remove worktree for interactive removal. Clean
-worktrees require one confirmation. Dirty worktrees require a destructive
-force-removal confirmation. The direct forms are devx worktree remove PROJECT
-and devx worktree remove PROJECT --force.
+Use devx pick and choose Remove worktree for interactive removal. Direct and
+interactive removals require confirmation. --force allows dirty removal but does
+not bypass confirmation; use --yes only for non-interactive automation. After
+successful interactive removal, devx separately offers safe local branch
+deletion with git branch -d. Non-interactive removal retains the local branch.
+Remote branches are never changed or offered for deletion.
 .SH CONFIGURATION OVERLAYS
 Set up a project once. With no project argument, fzf selects a checkout.
 .PP
@@ -176,6 +189,13 @@ values, new keys are appended, and unchanged base lines and comments remain.
 Duplicate keys in any input fail before writes.
 .properties support is limited to one logical key=value or key:value entry per
 line; escaped separators, escaped keys, and line continuations are unsupported.
+.PP
+Before replacement, devx revalidates destination content, file identity, and
+path components. Atomic replacement preserves Unix permission bits but not
+ownership, ACLs, or extended attributes. Staged files and containing
+directories are synchronized. A narrow race remains between final validation
+and rename because portable Rust does not expose directory-relative no-follow
+replacement.
 .SH LAUNCHERS
 The default configuration opens IntelliJ IDEA and Ghostty. All launchers
 are token arrays; {path} is replaced safely with the project directory.

@@ -70,7 +70,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-01: Preserve destination metadata and cleanly roll back overlay writes
 
-**Severity:** P1  
+**Severity:** P1
 **Evidence:** Source-confirmed in `write_config_batch()` at `src/main.rs:1642-1667`.
 
 **Problem:** Replacement files are created with default process permissions and renamed over existing files. This can change permission bits and other metadata. If staging a later file fails, earlier temp files are not cleaned. If a rename fails mid-batch, applied files are recreated with `fs::write`, which does not restore complete metadata, and unprocessed staged files can remain.
@@ -89,7 +89,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-02: Make configuration persistence atomic and concurrency-safe
 
-**Severity:** P1  
+**Severity:** P1
 **Evidence:** Source-confirmed in `save_config()` at `src/main.rs:2484-2487` and load-modify-save command patterns.
 
 **Problem:** The complete TOML file is written directly. A crash can truncate it, and two shell/Raycast invocations can load the same version and overwrite each other's updates.
@@ -108,7 +108,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-03: Apply the required confirmation policy to direct destructive commands
 
-**Severity:** P1  
+**Severity:** P1
 **Evidence:** Source-confirmed at `project remove` (`src/main.rs:929-937`) and direct worktree removal (`src/main.rs:1307-1341`).
 
 **Problem:** Picker removal confirms, but `devx worktree remove`, `--force`, and project unregister mutate immediately. This violates the requested product policy that destructive actions always confirm.
@@ -127,7 +127,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-04: Separate completed mutations from optional launcher handoff failures
 
-**Severity:** P1  
+**Severity:** P1
 **Evidence:** Source-confirmed in worktree creation (`src/main.rs:1275-1304`), project setup (`src/main.rs:1700-1730`), and global overlay creation (`src/main.rs:1733-1749`).
 
 **Problem:** These workflows mutate Git/files/state before launching an external app. If the launcher fails, the command exits as an error before printing mutation success, making users likely to retry an already-completed operation.
@@ -145,7 +145,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-05: Accept standard clone URLs without `.git`
 
-**Severity:** P1  
+**Severity:** P1
 **Evidence:** Source-confirmed in `repository_name_from_url()` at `src/main.rs:1016-1027`.
 
 **Problem:** `strip_suffix(".git").unwrap_or_default()` converts a valid basename without `.git` to an empty string.
@@ -181,7 +181,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-07: Replace silent empty pickers with actionable empty states
 
-**Severity:** P2  
+**Severity:** P2
 **Evidence:** Source-confirmed in `select_table()`/`select_many()` and callers; isolated `project list` also produced no output.
 
 **Problem:** Zero projects, primary projects, or worktrees are sent to `fzf`. Exit code 1 is treated like cancellation. Users cannot tell whether there was nothing to choose, they pressed Escape, or picker execution failed to produce a selection.
@@ -200,7 +200,7 @@ This is a recommendation, not a recorded final decision.
 
 ### F-08: Add concise progress for operations that can take noticeable time
 
-**Severity:** P2  
+**Severity:** P2
 **Evidence:** Source-confirmed synchronous scans/subprocess capture; runtime commands show no phase output.
 
 **Problem:** Recursive discovery, status collection, clone/fetch, worktree creation, config discovery, and merge validation can remain silent long enough to look frozen.
@@ -616,3 +616,195 @@ Constraints:
 ## Residual review limits
 
 The review did not launch or mutate the user's real applications, repositories, worktrees, Raycast setup, or overlays. Full interactive `fzf` behavior, AppleScript/Ghostty integration, failure injection, screen-reader behavior, large-data performance, and Linux execution remain runtime validation work. Findings clearly marked as risks must be reproduced in a controlled harness before being called confirmed defects.
+
+## F-01 Through F-09 Implementation Handoff
+
+**Implementation status:** A follow-up implementation changed `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/devx.1`, and `src/main.rs`. This section records the state after that work so a fresh reviewer can assess the actual diff instead of the original baseline alone.
+
+### Implemented behavior to scrutinize
+
+- F-01: Overlay writes stage all destinations before commit, preserve destination permissions, clean staged files after errors, attempt rollback after a failed replacement, reject managed-file symlinks, and print one success summary after the batch completes.
+- F-02: Configuration writes use an adjacent temporary file and rename; writes preserve existing permissions. An advisory `fs2` lock has a five-second bounded wait and is outside the resettable config directory so process exit releases it automatically.
+- F-03: Direct project unregister, direct worktree removal, and reset require default-No confirmation. `--yes` is the explicit non-TTY bypass. `--force` permits dirty worktree removal but does not bypass confirmation.
+- F-04: Worktree creation and overlay creation print durable success before optional launcher handoff. Launcher failures emit warnings with a manual path rather than reporting the mutation as failed.
+- F-05: Repository-name extraction accepts HTTPS, SSH, SCP-style, trailing-slash, `.git`, and no-`.git` clone URLs.
+- F-06: Reset separately detects the Raycast script even when config is already absent, identifies modified content in the prompt, refuses to replace an installed script symlink, and removes empty devx-owned Raycast subdirectories only when safe.
+- F-07: Project open, worktree create/remove, and overlay apply pickers preflight empty collections and provide contextual guidance. Empty multi-select returns without starting `fzf`.
+- F-08: Clone, scan refresh, worktree creation, config discovery, and overlay preview emit concise phase/status lines. Captured Git output still limits native progress visibility.
+- F-09: Setup saves launcher choices before root scanning, prints an explicit final root summary before cache refresh, reports what persisted on root/scan failures, and direct `project rename-root` and `project remove-root --yes` support root lifecycle management.
+
+### Verification run after implementation
+
+- `cargo fmt -- --check`: passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo test`: 30 passed, 0 failed.
+- `git diff --check`: passed.
+- `cargo run -- project --help`, `cargo run -- worktree remove --help`, and `cargo run -- reset --help`: passed.
+- Two independent read-only reviews were run with `github-copilot/gpt-5.6-sol`. Their identified temporary-file, staging cleanup, lock placement, Raycast-script, reset-path, and documentation issues were addressed before the final verification above.
+
+### Known remaining acceptance gaps
+
+Do not treat F-01 through F-09 as fully accepted until a reviewer verifies these gaps:
+
+- No CLI integration harness or CI workflow exists.
+- No injected staging failure, second-rename failure, or launcher-boundary integration test exists.
+- No cross-process contention, interrupted-write, reset-lock, or concurrent mutation integration test exists.
+- No real Git remote/worktree test covers create/remove/cancel/branch cleanup.
+- No interactive Raycast lifecycle, non-TTY confirmation, `fzf` process suppression, setup Ctrl+C, or redirected-progress integration test exists.
+- Pathname-based overlay replacement still requires a targeted time-of-check/time-of-use race review; the implementation rejects existing managed-file symlinks but does not use directory-descriptor-relative filesystem operations.
+- F-08 reports useful phases but does not yet satisfy all progress requirements for per-root scan visibility or native Git progress.
+- F-09 root lifecycle is available through direct commands, not as a full setup menu.
+
+### Second-review prompt
+
+```text
+Perform a read-only review of the current devx worktree.
+
+Read docs/ui-ux-workflow-review.md, especially “F-01 Through F-09 Implementation Handoff”, and docs/project-workflow-map.md. Then inspect the entire current diff, not only src/main.rs.
+
+Review F-01 through F-09 for correctness, data integrity, filesystem race/symlink safety, temporary-file permissions and cleanup, config concurrency and crash behavior, destructive-command confirmation semantics, truthful partial success, Raycast reset safety, empty states, progress, setup persistence, documentation alignment, and test adequacy.
+
+Treat the known remaining acceptance gaps as mandatory scrutiny points. Do not assume the listed implementation is correct. Return findings first, ordered by severity, with exact file:line references and reproductions or reasoning. State separately which acceptance criteria are fully met, partially met, or unmet. Do not edit files.
+```
+
+## Second Review Findings and Implementation Handoff
+
+**Review status:** The second review found that F-05 is fully met; F-01 through F-04, F-06, F-07, and F-09 are partially met; and F-08 remains incomplete. The review reran `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` (30 passed), and `git diff --check`; all passed. Passing unit checks do not cover the failure and concurrency boundaries below.
+
+Implement the findings in priority order. Preserve unrelated worktree changes and add tests at the closest practical boundary. If a platform-safe fix requires a larger design decision, leave the operation fail-closed and document the remaining limitation rather than weakening validation.
+
+### SR-01: Prevent stale and redirected overlay replacement
+
+**Severity:** P1
+**Evidence:** Source-confirmed in `config_apply()`, `ensure_within_checkout()`, and `write_config_batch()`.
+
+Destination content and path safety are validated before the preview confirmation. A concurrent edit made while the prompt is open is silently overwritten from the stale snapshot. A destination parent replaced with a symlink after validation can redirect temporary-file and rename operations outside the checkout.
+
+Required outcome:
+
+1. Immediately before staging or replacing each destination, verify that its content and filesystem identity still match the previewed file and that its resolved parent remains inside the canonical checkout.
+2. Abort the entire batch before replacement if any destination changed after preview.
+3. Reject symlinked destination components. Prefer directory-relative, no-follow filesystem operations where supported; otherwise clearly document and test the residual race.
+4. Add tests for concurrent content changes and parent-directory symlink substitution.
+
+### SR-02: Make Raycast path handling symlink-safe
+
+**Severity:** P1
+**Evidence:** Source-confirmed in `install_raycast_script()` and `reset()`.
+
+The final script component is checked during installation, but parent directories are not. Installation and reset can follow a symlinked `Script Commands/devx` directory and overwrite or delete a file outside the intended Raycast tree. Reset also follows a valid script symlink while comparing or deleting it, and skips a broken script symlink because `Path::exists()` is false.
+
+Required outcome:
+
+1. Validate every component below the trusted Raycast Script Commands root and refuse symlinked directories or script files.
+2. Detect broken final-component symlinks with `symlink_metadata` and fail safely.
+3. Revalidate immediately before write or removal.
+4. Add install and reset tests for parent symlinks, valid script symlinks, and broken script symlinks.
+
+### SR-03: Define complete non-TTY reset semantics
+
+**Severity:** P1
+**Evidence:** Reproducible in `reset()`: configuration removal passes the command's `yes` value, but Raycast removal calls `confirm_destructive(..., false)`.
+
+`devx reset --yes </dev/null` can delete configuration and then fail when an installed Raycast script requires a second confirmation. This contradicts the statement that `--yes` is the non-TTY bypass and leaves an avoidable partial-success error.
+
+Required outcome:
+
+1. Choose and document explicit automation semantics. Recommended: `--yes` confirms both reset actions while retaining the separate prompts for interactive use.
+2. Ensure non-TTY execution either completes both requested actions or intentionally leaves Raycast untouched without reporting the completed configuration deletion as a total failure.
+3. Report configuration and Raycast outcomes independently on partial failure.
+4. Add tests for TTY-independent `--yes`, no script, bundled script, modified script, and script-removal failure.
+
+### SR-04: Provide correct worktree-creation recovery
+
+**Severity:** P1
+**Evidence:** Source-confirmed in the save-failure branch of `worktree_create()`.
+
+After Git creates a worktree but configuration saving fails, the suggested `devx project add <path> --name <name>` recovery registers a normal project with no branch or template owner. It therefore loses overlay sharing and cannot be managed as a devx worktree.
+
+Required outcome:
+
+1. Do not recommend `project add` as equivalent recovery.
+2. Prefer a safe rollback of the newly created Git worktree and local branch when registration fails, or provide a dedicated recovery path that restores `is_worktree`, branch, and template-project metadata.
+3. Report exactly which Git objects remain if rollback is incomplete.
+4. Add a Git-backed test for Git success followed by configuration-save failure.
+
+### SR-05: Report and recover worktree-removal partial success
+
+**Severity:** P1
+**Evidence:** Source-confirmed in `worktree_remove()` after `git worktree remove` and before `save_config()`.
+
+If Git removes the worktree and configuration saving then fails, the command returns a generic error while stale registration remains. Branch cleanup is skipped and the output does not identify the completed deletion.
+
+Required outcome:
+
+1. Treat Git removal as a commit point and report it as completed even if state cleanup fails.
+2. Provide an exact recovery action that removes the stale worktree registration without implying checkout deletion.
+3. Do not offer branch deletion until state persistence succeeds, unless the output clearly models each independent result.
+4. Add a Git-backed save-failure test asserting filesystem, Git, state, and output behavior.
+
+### SR-06: Reduce configuration lock scope
+
+**Severity:** P2
+**Evidence:** Source-confirmed in `run()` and `ConfigLock::acquire()`.
+
+Nearly every command holds one exclusive lock for its full lifetime, including prompts, `fzf`, scans, Git network operations, launchers, and read-only commands. An idle prompt can make `doctor`, list, or open fail as busy after five seconds.
+
+Required outcome:
+
+1. Use no lock or a shared lock for genuinely read-only commands.
+2. Hold the exclusive lock only around load-modify-save transactions, not user interaction or slow external work.
+3. Re-read and revalidate state after interaction before committing so shorter locking does not reintroduce lost updates.
+4. Add cross-process tests for a waiting prompt, simultaneous independent reads, and competing mutations.
+
+### SR-07: Finish setup and empty-state behavior
+
+**Severity:** P2
+**Evidence:** Source-confirmed in `setup()` and `project_setup()`.
+
+Setup saves launcher choices only after all launcher prompts finish and accumulates root additions until the root section completes. Cancellation can still lose accepted in-progress choices. Root rename/remove exists only as direct commands. `project setup` calls `require_fzf()` before checking whether any projects exist, so an empty installation can fail for missing `fzf` or return silently instead of giving setup guidance.
+
+Required outcome:
+
+1. Define and test persistence semantics for cancellation at each setup stage.
+2. Persist accepted sections incrementally or deliberately make each section transactional and explain cancellation behavior.
+3. Check for available projects before probing or starting `fzf`, and print actionable setup guidance.
+4. Either add root rename/remove to setup or explicitly retain F-09 as partial in user-facing status documentation.
+
+### SR-08: Correct documentation to describe the implemented product
+
+**Severity:** P2
+
+`docs/project-workflow-map.md` mixes a historical baseline with current-tense workflow claims that are now false. Its setup, worktree creation/removal, reset, progress, destructive-state, dependency, and test-count sections must either be updated or the whole baseline portion must be unmistakably marked historical. The small note under “Documentation inconsistencies” is not sufficient.
+
+Also correct these specific statements:
+
+1. `README.md` and `docs/devx.1` say devx-created worktrees refresh the cache. Creation explicitly registers the worktree but does not refresh cached discovery.
+2. Branch-deletion documentation must say the offer occurs only for interactive removals; non-TTY removal retains the branch.
+3. The dependency inventory must include `fs2`, and current verification must distinguish the original 25-test baseline from the current 30 tests.
+4. Refresh or clearly label stale source line references in the original findings so they are not mistaken for current locations.
+
+### SR-09: Complete durability and integration coverage
+
+**Severity:** P2
+
+Adjacent temporary files and rename improve atomic visibility but do not establish power-loss durability because files and parent directories are not synchronized. Overlay replacement preserves Unix mode bits but not ownership, ACLs, or extended attributes, and cleanup errors are ignored. There is still no CLI integration harness or CI workflow.
+
+Required outcome:
+
+1. Decide and document the durability guarantee. If crash durability is promised, synchronize staged files and containing directories at the required commit points.
+2. Document which metadata is preserved and either preserve required ACL/xattr metadata or avoid claiming complete metadata preservation.
+3. Surface cleanup failures when they affect recovery confidence.
+4. Add an isolated CLI integration harness covering destructive confirmations, failure injection, real Git worktrees/remotes, launcher failures, Raycast lifecycle, empty pickers, and concurrent processes.
+
+### Implementation verification
+
+Before handing the work back, run:
+
+```sh
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+Report which SR findings were completed, which remain partial, and why. Do not describe a finding as complete solely because unit tests pass.

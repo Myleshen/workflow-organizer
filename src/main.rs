@@ -1,15 +1,19 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env, fs,
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use dialoguer::{Confirm, Input};
+use fs2::FileExt;
 use serde_yaml::{Mapping, Value};
 use similar::TextDiff;
 
@@ -31,7 +35,11 @@ enum Commands {
     /// Interactively configure applications, scan roots, cache, and Raycast.
     Setup,
     /// Remove all devx local configuration after confirmation.
-    Reset,
+    Reset {
+        /// Confirm removal without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the bundled manual, including installation and complete workflows.
     Man,
     /// Check local tools, configured applications, and devx setup.
@@ -66,13 +74,27 @@ enum ProjectCommand {
     },
     /// Show all registered projects.
     List,
-    /// Remove a registered project.
-    Remove { name: String },
+    /// Unregister a project without deleting its checkout.
+    Remove {
+        name: String,
+        /// Confirm removal without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Add a directory scanned when the project cache is refreshed.
     AddRoot {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
+    },
+    /// Rename a configured scan root without scanning repositories.
+    RenameRoot { name: String, new_name: String },
+    /// Remove a scan root from devx state without deleting repositories.
+    RemoveRoot {
+        name: String,
+        /// Confirm removal without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Refresh the cached repository and worktree list from scan roots.
     Refresh,
@@ -106,6 +128,9 @@ enum WorktreeCommand {
         /// Remove even when the worktree has uncommitted changes.
         #[arg(long)]
         force: bool,
+        /// Confirm removal without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -211,10 +236,13 @@ fn main() -> Result<()> {
 }
 
 fn run(command: Commands, paths: &Paths) -> Result<()> {
+    let _lock = command_uses_config(&command)
+        .then(|| ConfigLock::acquire(paths))
+        .transpose()?;
     match command {
         Commands::Init => init(paths),
         Commands::Setup => setup(paths),
-        Commands::Reset => reset(paths),
+        Commands::Reset { yes } => reset(paths, yes),
         Commands::Man => show_man_page(),
         Commands::Doctor => doctor(paths),
         Commands::Completions { shell } => completions(shell),
@@ -227,6 +255,13 @@ fn run(command: Commands, paths: &Paths) -> Result<()> {
         Commands::Worktree(command) => worktree(command, paths),
         Commands::Config(command) => config(command, paths),
     }
+}
+
+fn command_uses_config(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Man | Commands::Completions { .. } | Commands::Raycast(RaycastCommand::Install)
+    )
 }
 
 fn completions(shell: CompletionShell) -> Result<()> {
@@ -395,10 +430,23 @@ fn shell_quote(value: &str) -> String {
 
 fn install_raycast_script() -> Result<()> {
     let script = raycast_script_path()?;
+    let root = raycast_scripts_root()?;
     let directory = script
         .parent()
         .context("Raycast script path has no parent")?;
-    if script.exists()
+    validate_path_components(&root, &script, true, "Raycast script")?;
+    let existing = match fs::symlink_metadata(&script) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Some(file_snapshot(&script, "Raycast script")?)
+        }
+        Ok(_) => bail!(
+            "Raycast script path is not a regular file: {}",
+            script.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("cannot inspect installed Raycast script"),
+    };
+    if existing.is_some()
         && !Confirm::new()
             .with_prompt(format!(
                 "Replace existing Raycast script at {}?",
@@ -411,12 +459,42 @@ fn install_raycast_script() -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(directory)?;
-    fs::write(&script, include_bytes!("../raycast/devx-pick.sh"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+    validate_path_components(&root, &script, true, "Raycast script")?;
+    let temporary = temporary_path(&script, "raycast");
+    if let Err(error) = (|| -> Result<()> {
+        create_temporary_file(&temporary, include_bytes!("../raycast/devx-pick.sh"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+            fs::File::open(&temporary)?.sync_all()?;
+        }
+        Ok(())
+    })() {
+        let cleanup = remove_file_report(&temporary);
+        return Err(error).context(cleanup);
     }
+    if let Err(error) = validate_path_components(&root, &script, true, "Raycast script") {
+        let cleanup = remove_file_report(&temporary);
+        return Err(error).context(cleanup);
+    }
+    if let Err(error) = validate_file_snapshot(&script, existing.as_ref(), "Raycast script") {
+        let cleanup = remove_file_report(&temporary);
+        return Err(error).context(cleanup);
+    }
+    fs::rename(&temporary, &script).with_context(|| {
+        let cleanup = remove_file_report(&temporary);
+        format!(
+            "cannot install Raycast script {}; {cleanup}",
+            script.display()
+        )
+    })?;
+    sync_directory(directory).with_context(|| {
+        format!(
+            "Raycast script was installed at {}, but directory durability could not be confirmed",
+            script.display()
+        )
+    })?;
     println!("Installed Raycast script\n  {}", script.display());
     println!(
         "\nNext steps\n  1. Raycast Settings > Extensions > Script Commands > Add Directory\n  2. Add the directory above\n  3. Bind Devx Pick to a hotkey"
@@ -475,6 +553,12 @@ fn pick(paths: &Paths) -> Result<()> {
 fn pick_open(paths: &Paths) -> Result<()> {
     let mut config = load_config(paths)?;
     let available = available_projects(&config)?;
+    if available.is_empty() {
+        println!(
+            "No projects are available. Run: devx project add-root <path>, devx project add <path>, or devx setup"
+        );
+        return Ok(());
+    }
     let groups = project_groups(&available, &config.usage);
     let Some(repository) = select_table(
         "Choose a project",
@@ -559,6 +643,12 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
         .iter()
         .filter(|project| project.template_project.is_none())
         .collect();
+    if primary_projects.is_empty() {
+        println!(
+            "No primary projects are available. Register or discover a repository before creating a worktree."
+        );
+        return Ok(());
+    }
     let Some(project) = select_project("Choose a primary project", &primary_projects)? else {
         return Ok(());
     };
@@ -582,6 +672,10 @@ fn pick_remove_worktree(paths: &Paths) -> Result<()> {
         .iter()
         .filter(|project| project.is_worktree)
         .collect();
+    if worktrees.is_empty() {
+        println!("No worktrees exist.");
+        return Ok(());
+    }
     let Some(name) = select_project("Choose a worktree to remove", &worktrees)? else {
         return Ok(());
     };
@@ -600,12 +694,18 @@ fn pick_remove_worktree(paths: &Paths) -> Result<()> {
         println!("Worktree was not removed.");
         return Ok(());
     }
-    worktree_remove(&name, dirty, paths)
+    worktree_remove(&name, dirty, true, paths)
 }
 
 fn pick_config(paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
     let available = available_projects(&config)?;
+    if available.is_empty() {
+        println!(
+            "No projects are available. Register or discover a project before applying overlays."
+        );
+        return Ok(());
+    }
     let projects: Vec<_> = available.iter().collect();
     let Some(project) = select_project("Choose a project", &projects)? else {
         return Ok(());
@@ -633,8 +733,30 @@ fn setup(paths: &Paths) -> Result<()> {
         Config::default()
     };
     configure_launchers(&mut config)?;
-    configure_roots(&mut config)?;
-    refresh_project_cache(&mut config)?;
+    save_config(paths, &config)?;
+    if let Err(error) = configure_roots(&mut config) {
+        eprintln!("Setup stopped: launcher settings were saved; scan root changes were not saved.");
+        return Err(error);
+    }
+    println!(
+        "Setup summary\n  Scan roots: {}\n  Launcher settings: saved",
+        config.roots.len()
+    );
+    if !Confirm::new()
+        .with_prompt("Save scan root changes and refresh the project cache?")
+        .default(true)
+        .interact()?
+    {
+        println!("Setup stopped. Launcher settings were saved; scan root changes were not saved.");
+        return Ok(());
+    }
+    save_config(paths, &config)?;
+    if let Err(error) = refresh_project_cache(&mut config) {
+        eprintln!(
+            "Setup stopped: launcher and scan root settings were saved, but the project cache was not refreshed.\n  Recover with: devx project refresh"
+        );
+        return Err(error);
+    }
     save_config(paths, &config)?;
     println!(
         "Configured project cache\n  {} project(s)",
@@ -672,28 +794,157 @@ fn print_recommended_tools(config: &Config) {
     }
 }
 
-fn reset(paths: &Paths) -> Result<()> {
+fn reset(paths: &Paths, yes: bool) -> Result<()> {
     if !paths.config_dir.exists() {
         println!(
             "No devx configuration exists\n  {}",
             paths.config_dir.display()
         );
-        return Ok(());
-    }
-    if !Confirm::new()
-        .with_prompt(format!(
+    } else if !confirm_destructive(
+        &format!(
             "Remove all devx configuration and overlays from {}? Repositories will not be changed",
             paths.config_dir.display()
-        ))
-        .default(false)
-        .interact()?
-    {
+        ),
+        yes,
+    )? {
         println!("Configuration was not removed.");
         return Ok(());
+    } else {
+        fs::remove_dir_all(&paths.config_dir)?;
+        println!("Removed devx configuration.");
     }
-    fs::remove_dir_all(&paths.config_dir)?;
-    println!("Removed devx configuration.");
+    let script = raycast_script_path()?;
+    let root = raycast_scripts_root()?;
+    let metadata = match fs::symlink_metadata(&script) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("cannot inspect installed Raycast script"),
+    };
+    validate_path_components(&root, &script, false, "Raycast script")?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Raycast script path is not a regular file: {}",
+            script.display()
+        );
+    }
+    let snapshot = file_snapshot(&script, "Raycast script")?;
+    let bundled = include_bytes!("../raycast/devx-pick.sh");
+    let modified = snapshot.contents != bundled;
+    let prompt = if modified {
+        format!(
+            "Raycast script at {} differs from the bundled script. Remove it anyway?",
+            script.display()
+        )
+    } else {
+        format!("Remove installed Raycast script at {}?", script.display())
+    };
+    if !confirm_destructive(&prompt, yes)? {
+        println!("Raycast script was not changed.");
+        return Ok(());
+    }
+    validate_path_components(&root, &script, false, "Raycast script").with_context(|| {
+        "configuration removal completed, but Raycast cleanup was refused because its path changed"
+    })?;
+    validate_file_snapshot(&script, Some(&snapshot), "Raycast script").with_context(|| {
+        "configuration removal completed, but Raycast cleanup was refused because the script changed"
+    })?;
+    fs::remove_file(&script).with_context(|| {
+        format!(
+            "configuration removal completed, but cannot remove Raycast script {}",
+            script.display()
+        )
+    })?;
+    remove_empty_parent_directories(script.parent(), &root);
+    println!("Removed Raycast script.");
     Ok(())
+}
+
+fn validate_path_components(
+    root: &Path,
+    target: &Path,
+    allow_missing: bool,
+    label: &str,
+) -> Result<()> {
+    let relative = target
+        .strip_prefix(root)
+        .with_context(|| format!("{label} path is outside its trusted root"))?;
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing symlinked {label} path component {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {label} path {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn file_snapshot(path: &Path, label: &str) -> Result<FileSnapshot> {
+    Ok(FileSnapshot {
+        identity: file_identity(path)?,
+        contents: fs::read(path)
+            .with_context(|| format!("cannot read {label} {}", path.display()))?,
+    })
+}
+
+fn validate_file_snapshot(path: &Path, expected: Option<&FileSnapshot>, label: &str) -> Result<()> {
+    match expected {
+        Some(expected) => {
+            let current = file_snapshot(path, label)?;
+            if current.identity != expected.identity || current.contents != expected.contents {
+                bail!("{label} changed after confirmation: {}", path.display());
+            }
+        }
+        None => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("{label} appeared after confirmation: {}", path.display()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {label} path {}", path.display()));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn confirm_destructive(prompt: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("destructive command requires --yes when standard input is not a terminal");
+    }
+    Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .map_err(Into::into)
+}
+
+fn raycast_scripts_root() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+            .join("Library/Application Support/Raycast/Script Commands"),
+    )
+}
+
+fn remove_empty_parent_directories(mut directory: Option<&Path>, boundary: &Path) {
+    while let Some(path) = directory {
+        if path == boundary || !path.starts_with(boundary) || fs::remove_dir(path).is_err() {
+            break;
+        }
+        directory = path.parent();
+    }
 }
 
 fn launcher(command: LauncherCommand, paths: &Paths) -> Result<()> {
@@ -926,14 +1177,29 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
                 );
             }
         }
-        ProjectCommand::Remove { name } => {
-            let count = config.projects.len();
-            config.projects.retain(|project| project.name != name);
-            if config.projects.len() == count {
-                bail!("no project named '{name}' is registered");
+        ProjectCommand::Remove { name, yes } => {
+            if !config.projects.iter().any(|project| project.name == name) {
+                if config
+                    .cached_projects
+                    .iter()
+                    .any(|project| project.name == name)
+                {
+                    bail!(
+                        "project '{name}' is discovered from a scan root and cannot be unregistered individually"
+                    );
+                }
+                bail!("no explicitly registered project named '{name}' exists");
             }
+            if !confirm_destructive(
+                &format!("Unregister project '{name}'? Its checkout files will not be deleted"),
+                yes,
+            )? {
+                println!("Project was not unregistered.");
+                return Ok(());
+            }
+            config.projects.retain(|project| project.name != name);
             save_config(paths, &config)?;
-            println!("Removed {name}");
+            println!("Unregistered {name}. Checkout files were not deleted.");
         }
         ProjectCommand::AddRoot { path, name } => {
             let path = fs::canonicalize(&path)
@@ -961,7 +1227,45 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
             save_config(paths, &config)?;
             println!("Added scan root {name}");
         }
+        ProjectCommand::RenameRoot { name, new_name } => {
+            if config.roots.iter().any(|root| root.name == new_name) {
+                bail!("a root named '{new_name}' is already registered");
+            }
+            let root = config
+                .roots
+                .iter_mut()
+                .find(|root| root.name == name)
+                .with_context(|| format!("no scan root named '{name}' is registered"))?;
+            root.name = new_name.clone();
+            config
+                .roots
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            save_config(paths, &config)?;
+            println!("Renamed scan root {name} to {new_name}");
+        }
+        ProjectCommand::RemoveRoot { name, yes } => {
+            let root = config
+                .roots
+                .iter()
+                .find(|root| root.name == name)
+                .with_context(|| format!("no scan root named '{name}' is registered"))?;
+            if !confirm_destructive(
+                &format!(
+                    "Remove scan root '{name}' at {} from devx? Repositories will not be deleted",
+                    root.path.display()
+                ),
+                yes,
+            )? {
+                println!("Scan root was not removed.");
+                return Ok(());
+            }
+            config.roots.retain(|root| root.name != name);
+            refresh_project_cache(&mut config)?;
+            save_config(paths, &config)?;
+            println!("Removed scan root {name}. Repositories were not deleted.");
+        }
         ProjectCommand::Refresh => {
+            println!("Scanning {} root(s)...", config.roots.len());
             refresh_project_cache(&mut config)?;
             save_config(paths, &config)?;
             println!(
@@ -970,7 +1274,9 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
             );
         }
         ProjectCommand::Clone { root, url } => {
+            println!("Cloning {url} into scan root {root}...");
             clone_project(&config, &root, &url)?;
+            println!("Refreshing project cache...");
             refresh_project_cache(&mut config)?;
             save_config(paths, &config)?;
         }
@@ -1020,7 +1326,12 @@ fn repository_name_from_url(url: &str) -> Result<String> {
         .next()
         .unwrap_or_default()
         .strip_suffix(".git")
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            url.trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .unwrap_or_default()
+        });
     if repository.is_empty() || repository == "." || repository == ".." {
         bail!("cannot derive a repository name from '{url}'");
     }
@@ -1238,7 +1549,11 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
             branch,
             name,
         } => worktree_create(project, branch, name, paths),
-        WorktreeCommand::Remove { project, force } => worktree_remove(&project, force, paths),
+        WorktreeCommand::Remove {
+            project,
+            force,
+            yes,
+        } => worktree_remove(&project, force, yes, paths),
     }
 }
 
@@ -1272,7 +1587,9 @@ fn worktree_create(
         bail!("worktree path already exists: {}", destination.display());
     }
 
+    println!("Fetching origin for worktree {worktree_name}...");
     let default_branch = fetch_default_branch(&primary.path)?;
+    println!("Creating worktree at {}...", destination.display());
     run_git(
         &primary.path,
         [
@@ -1288,31 +1605,84 @@ fn worktree_create(
         name: worktree_name.clone(),
         path: destination.clone(),
         template_project: Some(primary.template_name().to_owned()),
-        branch: Some(branch),
+        branch: Some(branch.clone()),
         is_worktree: true,
     });
     config
         .projects
         .sort_by(|left, right| left.name.cmp(&right.name));
-    save_config(paths, &config)?;
-    launch(&config.launchers.editor, &destination, "editor")?;
-    launch(&config.launchers.terminal, &destination, "terminal")?;
+    if let Err(error) = save_config(paths, &config) {
+        let residual = rollback_created_worktree(&primary.path, &destination, &branch);
+        if residual.is_empty() {
+            bail!(
+                "worktree registration failed: {error}; the new worktree and local branch were rolled back"
+            );
+        }
+        bail!(
+            "worktree registration failed: {error}; rollback incomplete, remaining Git state: {}",
+            residual.join(", ")
+        );
+    }
     println!(
         "Created and registered {worktree_name}\n  {}",
         destination.display()
     );
+    launch_after_mutation(&config.launchers.editor, &destination, "editor");
+    launch_after_mutation(&config.launchers.terminal, &destination, "terminal");
     Ok(())
 }
 
-fn worktree_remove(name: &str, force: bool, paths: &Paths) -> Result<()> {
+fn rollback_created_worktree(primary: &Path, destination: &Path, branch: &str) -> Vec<String> {
+    let mut residual = Vec::new();
+    if Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(destination)
+        .current_dir(primary)
+        .status()
+        .map_or(true, |status| !status.success())
+    {
+        residual.push(format!("worktree at {}", destination.display()));
+    }
+    if Command::new("git")
+        .args(["branch", "-D", branch])
+        .current_dir(primary)
+        .status()
+        .map_or(true, |status| !status.success())
+    {
+        residual.push(format!("local branch '{branch}'"));
+    }
+    residual
+}
+
+fn worktree_remove(name: &str, force: bool, yes: bool, paths: &Paths) -> Result<()> {
     let mut config = load_config(paths)?;
     let available = available_projects(&config)?;
     let worktree = get_project(&available, name)?;
+    let explicitly_registered = config
+        .projects
+        .iter()
+        .any(|project| project.path == worktree.path);
     if !worktree.is_worktree {
         bail!("'{name}' is not a worktree; devx only removes worktrees");
     }
-    if is_dirty(&worktree.path) && !force {
+    let dirty = is_dirty(&worktree.path);
+    if dirty && !force {
         bail!("'{name}' has uncommitted changes; rerun with --force to remove it");
+    }
+    let consequence = if force && dirty {
+        "Uncommitted changes will be discarded"
+    } else {
+        "The worktree directory will be removed"
+    };
+    if !confirm_destructive(
+        &format!(
+            "Remove worktree '{name}' at {}? {consequence}",
+            worktree.path.display()
+        ),
+        yes,
+    )? {
+        println!("Worktree was not removed.");
+        return Ok(());
     }
     let primary_name = worktree.template_name();
     let primary = available
@@ -1336,9 +1706,58 @@ fn worktree_remove(name: &str, force: bool, paths: &Paths) -> Result<()> {
     config
         .cached_projects
         .retain(|project| project.path != worktree.path);
-    save_config(paths, &config)?;
+    if let Err(error) = save_config(paths, &config) {
+        let recovery = if explicitly_registered {
+            format!("devx project remove {name} --yes")
+        } else {
+            "devx project refresh".to_owned()
+        };
+        bail!(
+            "Git worktree '{name}' was removed from {}, but its devx registration remains because configuration could not be saved: {error}\n  Recover with: {recovery}",
+            worktree.path.display()
+        );
+    }
     println!("Removed worktree {name}\n  {}", worktree.path.display());
+    match &worktree.branch {
+        Some(branch) if std::io::stdin().is_terminal() => {
+            if confirm_destructive(
+                &format!("Delete local branch '{branch}'? Remote branches are untouched"),
+                false,
+            )? {
+                let output = Command::new("git")
+                    .args(["branch", "-d", branch])
+                    .current_dir(&primary.path)
+                    .output()
+                    .context("could not start git branch deletion")?;
+                if output.status.success() {
+                    println!("Deleted local branch {branch}. Remote branches were untouched.");
+                } else {
+                    println!(
+                        "Local branch '{branch}' was retained: {}\n  To discard an unmerged local branch explicitly: git -C {} branch -D {}",
+                        String::from_utf8_lossy(&output.stderr).trim(),
+                        primary.path.display(),
+                        branch
+                    );
+                }
+            } else {
+                println!("Local branch '{branch}' was retained. Remote branches were untouched.");
+            }
+        }
+        Some(branch) => {
+            println!("Local branch '{branch}' was retained. Remote branches were untouched.")
+        }
+        None => println!("Worktree was detached; no local branch deletion was offered."),
+    }
     Ok(())
+}
+
+fn launch_after_mutation(template: &[String], path: &Path, kind: &str) {
+    if let Err(error) = launch(template, path, kind) {
+        eprintln!(
+            "warning: {kind} launch failed after the mutation completed: {error}\n  Open manually: {}",
+            path.display()
+        );
+    }
 }
 
 fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
@@ -1603,15 +2022,25 @@ fn config_apply(paths: &Paths, project: &str) -> Result<()> {
                 .unified_diff()
                 .header(&destination.display().to_string(), "merged overlay")
                 .to_string();
-            changes.push((destination, old, new, diff));
+            changes.push(OverlayChange {
+                identity: file_identity(&destination)?,
+                destination,
+                old,
+                new,
+                diff,
+            });
         }
     }
     if changes.is_empty() {
         println!("No configuration changes.");
         return Ok(());
     }
-    for (_, _, _, diff) in &changes {
-        print!("{diff}");
+    println!(
+        "Previewing {} configuration change(s) for {project}.",
+        changes.len()
+    );
+    for change in &changes {
+        print!("{}", change.diff);
     }
     if !Confirm::new()
         .with_prompt(format!("Apply {} configuration change(s)?", changes.len()))
@@ -1621,11 +2050,45 @@ fn config_apply(paths: &Paths, project: &str) -> Result<()> {
         println!("No files changed.");
         return Ok(());
     }
-    write_config_batch(changes)?;
+    let change_count = changes.len();
+    write_config_batch(&checkout_root, &registered.path, changes)?;
+    println!("Applied {change_count} configuration change(s) for {project}.");
     Ok(())
 }
 
 fn ensure_within_checkout(checkout_root: &Path, destination: &Path, checkout: &Path) -> Result<()> {
+    if fs::symlink_metadata(destination)
+        .with_context(|| {
+            format!(
+                "cannot inspect base configuration {}",
+                destination.display()
+            )
+        })?
+        .file_type()
+        .is_symlink()
+    {
+        bail!(
+            "managed configuration {} is a symlink; refusing to replace it",
+            destination.display()
+        );
+    }
+    let parent = destination
+        .parent()
+        .context("managed configuration has no parent")?;
+    validate_path_components(checkout, parent, false, "managed configuration")?;
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "cannot access base configuration parent {}",
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(checkout_root) {
+        bail!(
+            "managed configuration {} resolves outside checkout {}",
+            destination.display(),
+            checkout.display()
+        );
+    }
     let canonical_destination = fs::canonicalize(destination)
         .with_context(|| format!("cannot access base configuration {}", destination.display()))?;
     if canonical_destination.starts_with(checkout_root) {
@@ -1639,38 +2102,283 @@ fn ensure_within_checkout(checkout_root: &Path, destination: &Path, checkout: &P
     }
 }
 
-fn write_config_batch(changes: Vec<(PathBuf, String, String, String)>) -> Result<()> {
-    let mut staged = Vec::new();
-    for (index, (destination, old, new, _)) in changes.into_iter().enumerate() {
-        let temporary =
-            destination.with_file_name(format!(".devx-{}-{index}.tmp", std::process::id()));
-        fs::write(&temporary, new)
-            .with_context(|| format!("cannot stage configuration {}", destination.display()))?;
-        staged.push((destination, old, temporary));
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
 
-    let mut applied = Vec::new();
-    for (destination, old, temporary) in staged {
-        if let Err(error) = fs::rename(&temporary, &destination) {
-            for (destination, old) in applied {
-                fs::write(destination, old).ok();
-            }
-            fs::remove_file(&temporary).ok();
-            bail!(
-                "cannot apply configuration {}: {error}",
-                destination.display()
-            );
-        }
-        println!("Updated\n  {}", destination.display());
-        applied.push((destination, old));
+struct FileSnapshot {
+    identity: FileIdentity,
+    contents: Vec<u8>,
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect configuration {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("configuration is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    return Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    });
+    #[cfg(not(unix))]
+    Ok(FileIdentity {
+        device: metadata.len(),
+        inode: metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos() as u64,
+    })
+}
+
+struct OverlayChange {
+    destination: PathBuf,
+    old: String,
+    new: String,
+    diff: String,
+    identity: FileIdentity,
+}
+
+struct StagedConfig {
+    destination: PathBuf,
+    original: Vec<u8>,
+    permissions: fs::Permissions,
+    temporary: PathBuf,
+}
+
+static TEMPORARY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+fn create_temporary_file(path: &Path, contents: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("cannot create temporary file {}", path.display()))?;
+    if let Err(error) = file.write_all(contents) {
+        let cleanup = remove_file_report(path);
+        return Err(error)
+            .with_context(|| format!("cannot write temporary file {}; {cleanup}", path.display()));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let cleanup = remove_file_report(path);
+        return Err(error).with_context(|| {
+            format!(
+                "cannot synchronize temporary file {}; {cleanup}",
+                path.display()
+            )
+        });
     }
     Ok(())
 }
 
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("cannot synchronize directory {}", path.display()))
+}
+
+fn remove_file_report(path: &Path) -> String {
+    match fs::remove_file(path) {
+        Ok(()) => format!("removed temporary file {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("temporary file {} was already absent", path.display())
+        }
+        Err(error) => format!(
+            "could not remove temporary file {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn temporary_path(destination: &Path, label: &str) -> PathBuf {
+    destination.with_file_name(format!(
+        ".devx-{label}-{}-{}.tmp",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn validate_overlay_change(
+    checkout_root: &Path,
+    checkout: &Path,
+    change: &OverlayChange,
+) -> Result<()> {
+    ensure_within_checkout(checkout_root, &change.destination, checkout)?;
+    if file_identity(&change.destination)? != change.identity {
+        bail!(
+            "configuration identity changed after preview: {}",
+            change.destination.display()
+        );
+    }
+    let current = fs::read_to_string(&change.destination).with_context(|| {
+        format!(
+            "cannot re-read configuration {}",
+            change.destination.display()
+        )
+    })?;
+    if current != change.old {
+        bail!(
+            "configuration content changed after preview: {}",
+            change.destination.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_config_batch(
+    checkout_root: &Path,
+    checkout: &Path,
+    changes: Vec<OverlayChange>,
+) -> Result<()> {
+    let mut staged = Vec::new();
+    for (index, change) in changes.iter().enumerate() {
+        validate_overlay_change(checkout_root, checkout, change)?;
+        let temporary = temporary_path(&change.destination, &index.to_string());
+        let result = (|| -> Result<()> {
+            create_temporary_file(&temporary, change.new.as_bytes()).with_context(|| {
+                format!(
+                    "cannot stage configuration {}",
+                    change.destination.display()
+                )
+            })?;
+            let metadata = fs::metadata(&change.destination).with_context(|| {
+                format!("cannot read metadata for {}", change.destination.display())
+            })?;
+            fs::set_permissions(&temporary, metadata.permissions()).with_context(|| {
+                format!(
+                    "cannot preserve permissions for {}",
+                    change.destination.display()
+                )
+            })?;
+            fs::File::open(&temporary)?.sync_all()?;
+            staged.push(StagedConfig {
+                destination: change.destination.clone(),
+                original: change.old.as_bytes().to_vec(),
+                permissions: metadata.permissions(),
+                temporary: temporary.clone(),
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut cleanup = vec![remove_file_report(&temporary)];
+            cleanup.extend(cleanup_staged_config(&staged));
+            return Err(error).context(format!("staging cleanup: {}", cleanup.join("; ")));
+        }
+    }
+
+    for change in &changes {
+        if let Err(error) = validate_overlay_change(checkout_root, checkout, change) {
+            let cleanup = cleanup_staged_config(&staged);
+            return Err(error).context(format!("staging cleanup: {}", cleanup.join("; ")));
+        }
+    }
+
+    let mut applied = Vec::new();
+    while !staged.is_empty() {
+        let staged_file = staged.remove(0);
+        let change = changes
+            .iter()
+            .find(|change| change.destination == staged_file.destination)
+            .context("staged configuration lost its preview record")?;
+        if let Err(error) = validate_overlay_change(checkout_root, checkout, change) {
+            let rollback = rollback_config_batch(&applied);
+            let mut cleanup = vec![remove_file_report(&staged_file.temporary)];
+            cleanup.extend(cleanup_staged_config(&staged));
+            bail!(
+                "{error}; rollback failures: {}; staging cleanup: {}",
+                rollback.join(", "),
+                cleanup.join("; ")
+            );
+        }
+        if let Err(error) = fs::rename(&staged_file.temporary, &staged_file.destination) {
+            let rollback = rollback_config_batch(&applied);
+            let mut cleanup = vec![remove_file_report(&staged_file.temporary)];
+            cleanup.extend(cleanup_staged_config(&staged));
+            let restored = if rollback.is_empty() {
+                "all prior destinations restored".to_owned()
+            } else {
+                format!("could not restore {}", rollback.join(", "))
+            };
+            bail!(
+                "cannot apply configuration {}: {error}; {restored}; cleanup: {}",
+                staged_file.destination.display(),
+                cleanup.join("; ")
+            );
+        }
+        applied.push(staged_file);
+        if let Err(error) = sync_directory(
+            applied
+                .last()
+                .context("applied configuration was not recorded")?
+                .destination
+                .parent()
+                .context("configuration has no parent")?,
+        ) {
+            let rollback = rollback_config_batch(&applied);
+            let cleanup = cleanup_staged_config(&staged);
+            bail!(
+                "configuration replacement completed but directory synchronization failed: {error}; rollback failures: {}; staging cleanup: {}",
+                rollback.join(", "),
+                cleanup.join("; ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_staged_config(staged: &[StagedConfig]) -> Vec<String> {
+    staged
+        .iter()
+        .map(|file| remove_file_report(&file.temporary))
+        .collect()
+}
+
+fn rollback_config_batch(applied: &[StagedConfig]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for file in applied.iter().rev() {
+        let temporary = temporary_path(&file.destination, "rollback");
+        let result = (|| -> Result<()> {
+            create_temporary_file(&temporary, &file.original)?;
+            fs::set_permissions(&temporary, file.permissions.clone())?;
+            fs::File::open(&temporary)?.sync_all()?;
+            fs::rename(&temporary, &file.destination)?;
+            sync_directory(
+                file.destination
+                    .parent()
+                    .context("configuration has no parent")?,
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            remove_file_report(&temporary);
+            failures.push(file.destination.display().to_string());
+        }
+    }
+    failures
+}
+
 fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
-    require_fzf()?;
     let mut config = load_config(paths)?;
     let available = available_projects(&config)?;
+    if available.is_empty() {
+        println!(
+            "No projects are available. Run: devx project add-root <path>, devx project add <path>, or devx setup"
+        );
+        return Ok(());
+    }
+    require_fzf()?;
     let project = match project {
         Some(project) => project,
         None => {
@@ -1682,6 +2390,10 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
         }
     };
     let selected = get_project(&available, &project)?;
+    println!(
+        "Discovering configuration files in {}...",
+        selected.path.display()
+    );
     let candidates = discover_config_files(&selected.path)?;
     if candidates.is_empty() {
         bail!(
@@ -1689,14 +2401,20 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
             selected.path.display()
         );
     }
+    println!(
+        "Found {} supported configuration file(s).",
+        candidates.len()
+    );
     let choices: Vec<_> = candidates
         .iter()
         .map(|path| path.display().to_string())
         .collect();
     let selected_files = select_many("Select files to manage", &choices)?;
     if selected_files.is_empty() {
+        println!("No configuration files selected.");
         return Ok(());
     }
+    let selected_count = selected_files.len();
     let owner = selected.template_name().to_owned();
     for selected_file in selected_files {
         let destination = PathBuf::from(selected_file);
@@ -1718,14 +2436,16 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
             .then_with(|| left.destination.cmp(&right.destination))
     });
     save_config(paths, &config)?;
-    launch(
+    println!(
+        "Configured {} overlay mapping(s)\n  Owner: {}\n  Directory: {}",
+        selected_count,
+        owner,
+        paths.overlays_dir(&owner).display()
+    );
+    launch_after_mutation(
         &config.launchers.config_editor,
         &paths.overlays_dir(&owner),
         "configuration editor",
-    )?;
-    println!(
-        "Configured overlays\n  Owner: {owner}\n  Directory: {}",
-        paths.overlays_dir(&owner).display()
     );
     Ok(())
 }
@@ -1740,12 +2460,12 @@ fn config_global_add(paths: &Paths) -> Result<()> {
     ensure_supported_config_file(&filename)?;
     let overlay = paths.global_overlays_dir().join(&filename);
     create_empty_overlay(&overlay)?;
-    launch(
+    println!("Created global overlay\n  {}", overlay.display());
+    launch_after_mutation(
         &config.launchers.config_editor,
         &paths.global_overlays_dir(),
         "configuration editor",
-    )?;
-    println!("Created global overlay\n  {}", overlay.display());
+    );
     Ok(())
 }
 
@@ -2253,6 +2973,9 @@ fn select_one(prompt: &str, choices: &[String]) -> Result<Option<String>> {
 }
 
 fn select_table(prompt: &str, header: &str, rows: &[String]) -> Result<Option<String>> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
     let mut child = Command::new("fzf")
         .args([
             "--prompt",
@@ -2304,6 +3027,9 @@ fn terminal_columns() -> u16 {
 }
 
 fn select_many(prompt: &str, choices: &[String]) -> Result<Vec<String>> {
+    if choices.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut child = Command::new("fzf")
         .args([
             "--prompt",
@@ -2481,9 +3207,82 @@ fn load_config(paths: &Paths) -> Result<Config> {
     Ok(config)
 }
 
+struct ConfigLock {
+    file: fs::File,
+}
+
+impl ConfigLock {
+    fn acquire(paths: &Paths) -> Result<Self> {
+        let path = paths.config_dir.with_extension("lock");
+        fs::create_dir_all(path.parent().context("configuration lock has no parent")?)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .context("cannot open devx configuration lock")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "configuration is busy; try again after the other devx command completes"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error).context("cannot lock devx configuration"),
+            }
+        }
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        self.file.unlock().ok();
+    }
+}
+
 fn save_config(paths: &Paths, config: &Config) -> Result<()> {
     fs::create_dir_all(&paths.config_dir)?;
-    fs::write(paths.config_file(), toml::to_string_pretty(config)?)?;
+    let destination = paths.config_file();
+    let temporary = paths.config_dir.join(format!(
+        ".config-{}-{}.tmp",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let contents = toml::to_string_pretty(config)?;
+    if let Err(error) = create_temporary_file(&temporary, contents.as_bytes()) {
+        fs::remove_file(&temporary).ok();
+        return Err(error)
+            .with_context(|| format!("cannot stage configuration {}", destination.display()));
+    }
+    if let Ok(metadata) = fs::metadata(&destination)
+        && let Err(error) = fs::set_permissions(&temporary, metadata.permissions())
+    {
+        fs::remove_file(&temporary).ok();
+        return Err(error)
+            .with_context(|| format!("cannot preserve permissions for {}", destination.display()));
+    }
+    fs::File::open(&temporary)?.sync_all()?;
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let cleanup = remove_file_report(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "cannot replace configuration {}; {cleanup}",
+                destination.display()
+            )
+        });
+    }
+    sync_directory(&paths.config_dir).with_context(|| {
+        format!(
+            "configuration was replaced at {}, but directory durability could not be confirmed",
+            destination.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -2525,6 +3324,269 @@ mod tests {
         let loaded = load_config(&paths).unwrap();
         assert_eq!(loaded.projects[0].name, "api");
         assert_eq!(loaded.projects[0].path, PathBuf::from("/tmp/api"));
+    }
+
+    #[test]
+    fn config_save_replaces_atomically_and_preserves_permissions() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        save_config(&paths, &Config::default()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(paths.config_file(), fs::Permissions::from_mode(0o600)).unwrap();
+        let config = Config {
+            cache_initialized: true,
+            ..Config::default()
+        };
+        save_config(&paths, &config).unwrap();
+        assert!(
+            toml::from_str::<Config>(&fs::read_to_string(paths.config_file()).unwrap()).is_ok()
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(paths.config_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(paths.config_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        }));
+    }
+
+    #[test]
+    fn config_lock_reports_contention() {
+        let directory = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        let lock = ConfigLock::acquire(&paths).unwrap();
+        assert!(ConfigLock::acquire(&paths).is_err());
+        drop(lock);
+        assert!(ConfigLock::acquire(&paths).is_ok());
+    }
+
+    #[test]
+    fn config_lock_is_bounded_when_contended() {
+        let directory = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        let lock = ConfigLock::acquire(&paths).unwrap();
+        let started = Instant::now();
+        assert!(ConfigLock::acquire(&paths).is_err());
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        drop(lock);
+    }
+
+    #[test]
+    fn derives_repository_names_from_standard_clone_urls() {
+        for (url, expected) in [
+            ("https://example.test/group/api.git", "api"),
+            ("https://example.test/group/api", "api"),
+            ("git@example.test:group/api.git", "api"),
+            ("git@example.test:group/api", "api"),
+            ("ssh://git@example.test/group/api.git/", "api"),
+        ] {
+            assert_eq!(repository_name_from_url(url).unwrap(), expected);
+        }
+        for url in ["", "/", ".", ".."] {
+            assert!(repository_name_from_url(url).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_write_preserves_permissions_and_leaves_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("config.properties");
+        fs::write(&destination, "value=old\n").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+        write_config_batch(
+            &fs::canonicalize(directory.path()).unwrap(),
+            directory.path(),
+            vec![OverlayChange {
+                identity: file_identity(&destination).unwrap(),
+                destination: destination.clone(),
+                old: "value=old\n".into(),
+                new: "value=new\n".into(),
+                diff: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "value=new\n");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".devx-")
+        }));
+    }
+
+    #[test]
+    fn batch_write_rejects_content_changed_after_preview() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("config.properties");
+        fs::write(&destination, "value=previewed\n").unwrap();
+        let change = OverlayChange {
+            identity: file_identity(&destination).unwrap(),
+            destination: destination.clone(),
+            old: "value=previewed\n".into(),
+            new: "value=overlay\n".into(),
+            diff: String::new(),
+        };
+        fs::write(&destination, "value=concurrent\n").unwrap();
+
+        let error = write_config_batch(
+            &fs::canonicalize(directory.path()).unwrap(),
+            directory.path(),
+            vec![change],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("content changed after preview"));
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "value=concurrent\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_write_rejects_parent_replaced_with_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        let parent = checkout.join("config");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let destination = parent.join("app.yml");
+        fs::write(&destination, "value: previewed\n").unwrap();
+        let change = OverlayChange {
+            identity: file_identity(&destination).unwrap(),
+            destination: destination.clone(),
+            old: "value: previewed\n".into(),
+            new: "value: overlay\n".into(),
+            diff: String::new(),
+        };
+        fs::remove_dir_all(&parent).unwrap();
+        fs::write(outside.join("app.yml"), "value: outside\n").unwrap();
+        symlink(&outside, &parent).unwrap();
+
+        let error = write_config_batch(
+            &fs::canonicalize(&checkout).unwrap(),
+            &checkout,
+            vec![change],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked managed configuration")
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("app.yml")).unwrap(),
+            "value: outside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raycast_path_validation_rejects_parent_and_broken_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("Script Commands");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("devx")).unwrap();
+        let script = root.join("devx/devx-pick.sh");
+        assert!(validate_path_components(&root, &script, true, "Raycast script").is_err());
+
+        fs::remove_file(root.join("devx")).unwrap();
+        fs::create_dir(root.join("devx")).unwrap();
+        symlink(directory.path().join("missing"), &script).unwrap();
+        assert!(validate_path_components(&root, &script, true, "Raycast script").is_err());
+        assert!(validate_path_components(&root, &script, false, "Raycast script").is_err());
+    }
+
+    #[test]
+    fn file_snapshot_rejects_changed_or_unexpected_raycast_script() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("devx-pick.sh");
+        fs::write(&script, "previewed").unwrap();
+        let snapshot = file_snapshot(&script, "Raycast script").unwrap();
+
+        fs::write(&script, "changed").unwrap();
+        assert!(
+            validate_file_snapshot(&script, Some(&snapshot), "Raycast script")
+                .unwrap_err()
+                .to_string()
+                .contains("changed after confirmation")
+        );
+        assert!(
+            validate_file_snapshot(&script, None, "Raycast script")
+                .unwrap_err()
+                .to_string()
+                .contains("appeared after confirmation")
+        );
+    }
+
+    #[test]
+    fn rolls_back_created_git_worktree_and_branch() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktree = directory.path().join("worktree");
+        fs::create_dir(&repository).unwrap();
+        run_git(&repository, ["init"]).unwrap();
+        run_git(&repository, ["config", "user.email", "devx@example.test"]).unwrap();
+        run_git(&repository, ["config", "user.name", "devx test"]).unwrap();
+        fs::write(repository.join("README"), "test\n").unwrap();
+        run_git(&repository, ["add", "README"]).unwrap();
+        run_git(&repository, ["commit", "-m", "initial"]).unwrap();
+        run_git(
+            &repository,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(rollback_created_worktree(&repository, &worktree, "feature").is_empty());
+        assert!(!worktree.exists());
+        assert!(
+            !Command::new("git")
+                .args(["show-ref", "--verify", "refs/heads/feature"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]
@@ -2710,7 +3772,7 @@ mod tests {
             &checkout,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("outside checkout"));
+        assert!(error.to_string().contains("symlink"));
     }
 
     #[test]
