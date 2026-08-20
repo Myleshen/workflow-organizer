@@ -1,0 +1,184 @@
+.TH DEVX 1
+.SH NAME
+devx \- macOS project, worktree, and local configuration overlay navigator
+.SH SYNOPSIS
+.B devx
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B devx
+opens Git projects and worktrees, creates worktrees, and applies local
+configuration overlays without storing local settings in project repositories.
+Configuration is stored in
+.IR $XDG_CONFIG_HOME/devx ,
+or
+.IR ~/.config/devx
+when XDG_CONFIG_HOME is not set.
+.SH INSTALLATION
+Install the binary from a checkout:
+.PP
+.EX
+cargo install --path .
+.EE
+.PP
+Interactive commands require fzf:
+.PP
+.EX
+brew install fzf
+.EE
+.PP
+All fzf prompts match case-insensitively. Press Esc to cancel a picker, or
+Ctrl+C at any prompt to stop devx and its active child process. devx does not
+continue to later writes after cancellation.
+.SH QUICK START
+For first-time setup, run
+.B devx setup
+to discover applications in /Applications, ~/Applications, and Homebrew Cask,
+choose application roles, add scan roots, refresh the project cache, and
+optionally install the Raycast command. All selections are stored in config.toml.
+.PP
+Register directories containing repositories, then refresh the cached list when
+repositories or externally-created worktrees change. Clones and worktrees made
+by devx refresh the cache automatically.
+.PP
+.EX
+devx project add-root ~/dev
+devx project refresh
+.EE
+.TP
+.B devx launcher edit
+Interactively update the IDE/editor, terminal, configuration editor, and
+Raycast terminal applications without changing projects or overlays.
+.TP
+.B devx launcher list
+Print the configured launcher commands.
+.TP
+.B devx reset
+After confirmation, remove all devx configuration and overlays. Repositories
+and Git worktrees are never changed.
+.SH DIAGNOSTICS AND COMPLETIONS
+.B devx doctor
+checks Git, fzf, configured applications, local configuration, and the Raycast
+script command. Missing dependencies include a resolution command.
+.PP
+.B devx completions zsh
+and
+.B devx completions fish
+write shell completion scripts to standard output. For zsh, save the result to
+~/.zfunc/_devx and add ~/.zfunc to fpath before running compinit. For fish,
+save it to ~/.config/fish/completions/devx.fish.
+.SH PROJECTS
+.TP
+.B devx project add PATH [--name NAME]
+Register a checkout outside scan roots or give one an explicit alias.
+.TP
+.B devx project add-root PATH [--name NAME]
+Register a directory to scan recursively for Git repositories when refreshed.
+.TP
+.B devx project refresh
+Refresh the cached repository and worktree list from all registered scan roots.
+.TP
+.B devx project list
+List registered and discovered repositories and worktrees.
+.TP
+.B devx project remove NAME
+Remove an explicitly registered project. It does not delete files.
+.TP
+.B devx project clone ROOT URL
+Clone a repository beneath a named scan root without opening applications.
+.TP
+.B devx open NAME [--no-editor] [--no-terminal]
+Open a checkout in the configured editor and terminal.
+.TP
+.B devx pick
+Use fzf to select and open checkouts, create worktrees, set up overlays, or
+apply overlays. Opening ranks repository groups by previous usage before fzf
+filters them. Pickers use compact tables with headers. Narrow terminals show
+name, branch, state, and checkout type; terminals at least 100 columns wide
+also show the home-relative path.
+.SH WORKTREES
+.B devx worktree create PROJECT BRANCH [--name NAME]
+fetches origin, resolves its default branch, creates a new branch, and puts the
+worktree under the scan-root sibling layout:
+.PP
+.EX
+~/dev/.worktrees/my-service/feature-login
+.EE
+.PP
+Existing worktrees are discovered with Git and are not moved. New worktrees
+share their primary project's configuration overlays and open in the configured
+editor and terminal after creation.
+.SH CONFIGURATION OVERLAYS
+Set up a project once. With no project argument, fzf selects a checkout.
+.PP
+.EX
+devx project setup my-service
+.EE
+.PP
+Select one or more existing .yml, .yaml, .properties, or .env files. For each,
+devx creates empty overlays with the same project-relative path:
+.PP
+.EX
+~/.config/devx/configs/global/src/main/resources/bootstrap.yml
+~/.config/devx/configs/my-service/src/main/resources/bootstrap.yml
+.EE
+.PP
+The project directory is opened with the lightweight configuration editor,
+which defaults to Zed. Configure it in config.toml as a token array:
+.PP
+.EX
+[launchers]
+config_editor = ["open", "-a", "Zed", "{path}"]
+.EE
+.TP
+.B devx config global-add
+Prompt for a supported project-relative filename and create an empty global
+overlay. A global overlay affects only projects mapped to that relative path.
+.TP
+.B devx config list PROJECT
+List configuration files mapped for a project and its worktrees.
+.TP
+.B devx config apply PROJECT
+Merge and preview all mapped files as one batch, then request one confirmation
+before writing any files.
+.PP
+Precedence is base project file, then global overlay, then project overlay.
+YAML overlays use nested mappings only. Mappings merge recursively, scalars
+replace scalars, and lists replace lists. Dotted YAML overlay keys, duplicate
+keys, and YAML type conflicts fail before any write. YAML formatting and
+comments are normalized after a semantic merge.
+.PP
+.properties and .env overlays merge by key. Later layers replace earlier
+values, new keys are appended, and unchanged base lines and comments remain.
+Duplicate keys in any input fail before writes.
+.properties support is limited to one logical key=value or key:value entry per
+line; escaped separators, escaped keys, and line continuations are unsupported.
+.SH LAUNCHERS
+The default configuration opens IntelliJ IDEA and Ghostty. All launchers
+are token arrays; {path} is replaced safely with the project directory.
+.PP
+.EX
+[launchers]
+editor = ["open", "-a", "IntelliJ IDEA", "{path}"]
+terminal = ["open", "-a", "Ghostty", "{path}"]
+.EE
+.SH FILES
+.TP
+.I ~/.config/devx/config.toml
+Project registry, scan roots, usage history, launcher configuration, and
+managed overlay mappings.
+.TP
+.I ~/.config/devx/configs/
+Global and project-specific overlay files.
+.SH SEE ALSO
+Run
+.B devx --help
+or
+.B devx COMMAND --help
+for clap-generated command and option reference.
+.SH RAYCAST
+Run devx raycast install to install a bundled Raycast Script Command under
+~/Library/Application Support/Raycast/Script Commands/devx. Add that directory
+in Raycast Settings, Extensions, Script Commands, Add Directory, then assign
+Devx Pick a hotkey. It starts devx pick in Ghostty.
+The launcher is configurable with [launchers].raycast_terminal.
