@@ -26,6 +26,10 @@ editor, and Raycast terminal; prompts for one or more scan roots; refreshes the
 project cache; and can install the Raycast command. Selections are saved in
 `~/.config/devx/config.toml` for all later commands.
 
+`setup` also prints optional Homebrew recommendations for the opinionated stack:
+Ghostty, Zed, and LazyGit. It does not install or require them. LazyGit becomes
+required only while the default workspace workflow is enabled.
+
 Change only application choices later:
 
 ```sh
@@ -40,6 +44,9 @@ worktrees:
 ```sh
 devx reset
 ```
+
+If the optional Raycast Script Command is installed, reset also offers to remove
+it. The script is otherwise left untouched.
 
 The installed binary includes this complete manual, so users do not need the
 repository to learn the workflows:
@@ -124,6 +131,42 @@ devx project set-template my-service-feature my-service
 `devx open` starts both configured launchers. Use `--no-editor` or
 `--no-terminal` to skip one for a particular invocation.
 
+## Workspace Default
+
+`devx pick` opens the selected checkout in the default workspace: editor plus a
+terminal workspace with the configured VCS tool. The default is LazyGit. With
+Ghostty, `devx` uses Ghostty's native macOS split: a shell on the left and
+LazyGit on the right. Other terminals use a tmux split only when `tmux` is
+installed and their launcher includes `{command}`; otherwise they open normally.
+
+Direct `devx open <name>` remains a normal editor-and-terminal open. Force a
+workspace explicitly with:
+
+```sh
+devx workspace my-service
+```
+
+Disable the default picker workspace or select another VCS tool in
+the interactive configuration flow:
+
+```sh
+devx workspace --configure
+```
+
+It asks whether `pick` should use workspaces, accepts a VCS command, and shows
+the selected terminal behavior. Advanced users can edit
+`~/.config/devx/config.toml` directly:
+
+```toml
+[workspace]
+enabled = true
+vcs = ["lazygit"]
+```
+
+Set `enabled = false` to make `pick` open normal terminals. `vcs` is a token
+array, so alternatives such as `git gui` can be configured as
+`vcs = ["git", "gui"]`.
+
 Use `devx pick` to choose an action with `fzf`: open a registered checkout,
 create a worktree, set up configuration overlays, or apply them. The direct
 commands remain available for scripting. The open picker lists the most
@@ -184,6 +227,16 @@ needed.
 After creation, `devx` opens the new worktree in the configured editor and
 terminal automatically.
 
+Remove a worktree through the picker with `devx pick` and **Remove worktree**.
+Clean worktrees require one confirmation. Dirty worktrees show a destructive
+force-removal confirmation before their uncommitted changes are discarded. The
+non-interactive equivalent is:
+
+```sh
+devx worktree remove my-service-feature-login
+devx worktree remove my-service-feature-login --force
+```
+
 The new entry gets `template_project = "my-service"` automatically. It shares
 the main project's managed overlays while retaining its own registered name.
 
@@ -235,6 +288,15 @@ Apply every mapped file to a checkout or worktree in one previewed batch:
 devx config list my-service
 devx config apply my-service
 ```
+
+Search the mapped base configuration and matching global/project overlays with
+case-insensitive ripgrep output:
+
+```sh
+devx config search my-service config-server
+```
+
+This requires `rg` (`brew install ripgrep`) only for search.
 
 `config apply` merges `base project file < global overlay < project overlay`,
 prints every unified diff, and performs no writes unless a single confirmation

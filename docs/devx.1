@@ -36,6 +36,8 @@ For first-time setup, run
 to discover applications in /Applications, ~/Applications, and Homebrew Cask,
 choose application roles, add scan roots, refresh the project cache, and
 optionally install the Raycast command. All selections are stored in config.toml.
+Setup recommends Ghostty, Zed, and LazyGit when absent, but does not install
+them. LazyGit is required only when the workspace workflow is enabled.
 .PP
 Register directories containing repositories, then refresh the cached list when
 repositories or externally-created worktrees change. Clones and worktrees made
@@ -55,7 +57,8 @@ Print the configured launcher commands.
 .TP
 .B devx reset
 After confirmation, remove all devx configuration and overlays. Repositories
-and Git worktrees are never changed.
+and Git worktrees are never changed. If installed, the Raycast script can also
+be removed.
 .SH DIAGNOSTICS AND COMPLETIONS
 .B devx doctor
 checks Git, fzf, configured applications, local configuration, and the Raycast
@@ -90,6 +93,17 @@ Clone a repository beneath a named scan root without opening applications.
 .B devx open NAME [--no-editor] [--no-terminal]
 Open a checkout in the configured editor and terminal.
 .TP
+.B devx workspace NAME
+Open the configured terminal workspace for a checkout. The default VCS tool is
+LazyGit. On Ghostty, devx uses a native macOS split with the shell on the left
+and LazyGit on the right. Other terminals use tmux only when installed and the
+terminal launcher supports {command}; otherwise devx opens a normal terminal.
+.PP
+devx pick uses this workspace by default, while direct devx open remains normal.
+Run devx workspace --configure to interactively enable or disable it and set
+the VCS command. Set [workspace].enabled = false in config.toml to disable it
+manually.
+.TP
 .B devx pick
 Use fzf to select and open checkouts, create worktrees, set up overlays, or
 apply overlays. Opening ranks repository groups by previous usage before fzf
@@ -108,6 +122,11 @@ worktree under the scan-root sibling layout:
 Existing worktrees are discovered with Git and are not moved. New worktrees
 share their primary project's configuration overlays and open in the configured
 editor and terminal after creation.
+.PP
+Use devx pick and choose Remove worktree for interactive removal. Clean
+worktrees require one confirmation. Dirty worktrees require a destructive
+force-removal confirmation. The direct forms are devx worktree remove PROJECT
+and devx worktree remove PROJECT --force.
 .SH CONFIGURATION OVERLAYS
 Set up a project once. With no project argument, fzf selects a checkout.
 .PP
@@ -141,6 +160,10 @@ List configuration files mapped for a project and its worktrees.
 .B devx config apply PROJECT
 Merge and preview all mapped files as one batch, then request one confirmation
 before writing any files.
+.TP
+.B devx config search PROJECT QUERY
+Use case-insensitive ripgrep to search the mapped base files and matching global
+and project overlays. Requires rg, installed with brew install ripgrep.
 .PP
 Precedence is base project file, then global overlay, then project overlay.
 YAML overlays use nested mappings only. Mappings merge recursively, scalars
