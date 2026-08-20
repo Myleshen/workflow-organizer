@@ -10,11 +10,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use dialoguer::{Confirm, Input};
-use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use similar::TextDiff;
 
-const CONFIG_FILE: &str = "config.toml";
+mod state;
+
+use state::{Config, Launchers, ManagedFile, Paths, Project, ScanRoot, Usage};
 
 #[derive(Parser)]
 #[command(about = "macOS project, worktree, and configuration helper")]
@@ -45,6 +46,8 @@ enum Commands {
     Project(ProjectCommand),
     /// Open a registered project or worktree in configured applications.
     Open(OpenArgs),
+    /// Open or configure the terminal workspace.
+    Workspace(WorkspaceArgs),
     /// Interactively select common project, worktree, and configuration actions.
     Pick,
     #[command(subcommand)]
@@ -96,6 +99,14 @@ enum WorktreeCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a registered worktree and its Git worktree directory.
+    Remove {
+        /// Registered worktree name.
+        project: String,
+        /// Remove even when the worktree has uncommitted changes.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +140,18 @@ struct OpenArgs {
     /// Do not open the configured terminal.
     #[arg(long)]
     no_terminal: bool,
+    /// Use the configured terminal workspace instead of a normal terminal.
+    #[arg(long)]
+    workspace: bool,
+}
+
+#[derive(Args)]
+struct WorkspaceArgs {
+    /// Project or worktree to open in the workspace.
+    name: Option<String>,
+    /// Interactively configure the workspace behavior.
+    #[arg(long)]
+    configure: bool,
 }
 
 #[derive(Subcommand)]
@@ -139,77 +162,8 @@ enum ConfigCommand {
     List { project: String },
     /// Create an empty global overlay file and open the global overlay directory.
     GlobalAdd,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-struct Config {
-    #[serde(default)]
-    projects: Vec<Project>,
-    #[serde(default)]
-    roots: Vec<ScanRoot>,
-    #[serde(default)]
-    usage: HashMap<String, Usage>,
-    #[serde(default)]
-    launchers: Launchers,
-    #[serde(default)]
-    managed_files: Vec<ManagedFile>,
-    #[serde(default)]
-    cached_projects: Vec<Project>,
-    #[serde(default)]
-    cache_initialized: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct Usage {
-    opens: u64,
-    last_opened: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ScanRoot {
-    name: String,
-    path: PathBuf,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct Project {
-    name: String,
-    path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    template_project: Option<String>,
-    #[serde(default)]
-    branch: Option<String>,
-    #[serde(default)]
-    is_worktree: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct ManagedFile {
-    project: String,
-    destination: PathBuf,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Launchers {
-    #[serde(default = "default_editor")]
-    editor: Vec<String>,
-    #[serde(default = "default_terminal")]
-    terminal: Vec<String>,
-    #[serde(default = "default_config_editor")]
-    config_editor: Vec<String>,
-    #[serde(default = "default_raycast_terminal")]
-    raycast_terminal: Vec<String>,
-}
-
-impl Default for Launchers {
-    fn default() -> Self {
-        Self {
-            editor: default_editor(),
-            terminal: default_terminal(),
-            config_editor: default_config_editor(),
-            raycast_terminal: default_raycast_terminal(),
-        }
-    }
+    /// Search mapped base and overlay configuration with ripgrep.
+    Search { project: String, query: String },
 }
 
 fn default_editor() -> Vec<String> {
@@ -247,31 +201,8 @@ fn default_raycast_terminal() -> Vec<String> {
     ]
 }
 
-struct Paths {
-    config_dir: PathBuf,
-}
-
-impl Paths {
-    fn from_environment() -> Result<Self> {
-        let config_dir = match env::var_os("XDG_CONFIG_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".config"),
-        };
-        Ok(Self {
-            config_dir: config_dir.join("devx"),
-        })
-    }
-
-    fn config_file(&self) -> PathBuf {
-        self.config_dir.join(CONFIG_FILE)
-    }
-    fn overlays_dir(&self, project: &str) -> PathBuf {
-        self.config_dir.join("configs").join(project)
-    }
-
-    fn global_overlays_dir(&self) -> PathBuf {
-        self.overlays_dir("global")
-    }
+fn default_vcs() -> Vec<String> {
+    vec!["lazygit".into()]
 }
 
 fn main() -> Result<()> {
@@ -291,6 +222,7 @@ fn run(command: Commands, paths: &Paths) -> Result<()> {
         Commands::Launcher(command) => launcher(command, paths),
         Commands::Project(command) => project(command, paths),
         Commands::Open(args) => open(args, paths),
+        Commands::Workspace(args) => workspace(args, paths),
         Commands::Pick => pick(paths),
         Commands::Worktree(command) => worktree(command, paths),
         Commands::Config(command) => config(command, paths),
@@ -360,6 +292,20 @@ fn doctor(paths: &Paths) -> Result<()> {
             }),
         &mut check,
     );
+    if config
+        .as_ref()
+        .is_none_or(|config| config.workspace.enabled)
+    {
+        let vcs = config
+            .as_ref()
+            .map_or_else(default_vcs, |config| config.workspace.vcs.clone());
+        let command = vcs.first().context("workspace VCS command is empty")?;
+        check(
+            "workspace VCS",
+            command_exists(command),
+            "install the configured VCS tool or set [workspace].enabled = false",
+        );
+    }
     check(
         "configuration",
         paths.config_file().exists(),
@@ -448,9 +394,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn install_raycast_script() -> Result<()> {
-    let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
-    let directory = home.join("Library/Application Support/Raycast/Script Commands/devx");
-    let script = directory.join("devx-pick.sh");
+    let script = raycast_script_path()?;
+    let directory = script
+        .parent()
+        .context("Raycast script path has no parent")?;
     if script.exists()
         && !Confirm::new()
             .with_prompt(format!(
@@ -463,7 +410,7 @@ fn install_raycast_script() -> Result<()> {
         println!("Raycast script was not changed.");
         return Ok(());
     }
-    fs::create_dir_all(&directory)?;
+    fs::create_dir_all(directory)?;
     fs::write(&script, include_bytes!("../raycast/devx-pick.sh"))?;
     #[cfg(unix)]
     {
@@ -475,6 +422,13 @@ fn install_raycast_script() -> Result<()> {
         "\nNext steps\n  1. Raycast Settings > Extensions > Script Commands > Add Directory\n  2. Add the directory above\n  3. Bind Devx Pick to a hotkey"
     );
     Ok(())
+}
+
+fn raycast_script_path() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+            .join("Library/Application Support/Raycast/Script Commands/devx/devx-pick.sh"),
+    )
 }
 
 fn show_man_page() -> Result<()> {
@@ -499,6 +453,7 @@ fn pick(paths: &Paths) -> Result<()> {
         &[
             "Open project or worktree".to_owned(),
             "Create worktree".to_owned(),
+            "Remove worktree".to_owned(),
             "Set up configuration overlays".to_owned(),
             "Apply configuration overlays".to_owned(),
         ],
@@ -510,6 +465,7 @@ fn pick(paths: &Paths) -> Result<()> {
     match action.as_str() {
         "Open project or worktree" => pick_open(paths),
         "Create worktree" => pick_worktree(paths),
+        "Remove worktree" => pick_remove_worktree(paths),
         "Set up configuration overlays" => project_setup(None, paths),
         "Apply configuration overlays" => pick_config(paths),
         _ => unreachable!("picker returned an unknown action"),
@@ -545,6 +501,7 @@ fn pick_open(paths: &Paths) -> Result<()> {
             name: name.clone(),
             no_editor: false,
             no_terminal: false,
+            workspace: config.workspace.enabled,
         },
         paths,
     )?;
@@ -618,6 +575,34 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
     )
 }
 
+fn pick_remove_worktree(paths: &Paths) -> Result<()> {
+    let config = load_config(paths)?;
+    let available = available_projects(&config)?;
+    let worktrees: Vec<_> = available
+        .iter()
+        .filter(|project| project.is_worktree)
+        .collect();
+    let Some(name) = select_project("Choose a worktree to remove", &worktrees)? else {
+        return Ok(());
+    };
+    let selected = get_project(&available, &name)?;
+    let dirty = is_dirty(&selected.path);
+    let prompt = if dirty {
+        format!("'{name}' is dirty. Force-remove it and discard uncommitted changes?")
+    } else {
+        format!("Remove worktree '{name}'?")
+    };
+    if !Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?
+    {
+        println!("Worktree was not removed.");
+        return Ok(());
+    }
+    worktree_remove(&name, dirty, paths)
+}
+
 fn pick_config(paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
     let available = available_projects(&config)?;
@@ -663,7 +648,28 @@ fn setup(paths: &Paths) -> Result<()> {
         install_raycast_script()?;
     }
     println!("\nSetup complete\n  Run: devx doctor");
+    print_recommended_tools(&config);
     Ok(())
+}
+
+fn print_recommended_tools(config: &Config) {
+    let mut missing = Vec::new();
+    if !application_exists("Ghostty") {
+        missing.push("Ghostty: brew install --cask ghostty");
+    }
+    if !application_exists("Zed") {
+        missing.push("Zed: brew install --cask zed");
+    }
+    if config.workspace.enabled && !command_exists("lazygit") {
+        missing.push("LazyGit: brew install lazygit");
+    }
+    if missing.is_empty() {
+        return;
+    }
+    println!("\nOptional recommended tools");
+    for tool in missing {
+        println!("  {tool}");
+    }
 }
 
 fn reset(paths: &Paths) -> Result<()> {
@@ -1226,11 +1232,22 @@ fn is_git_checkout(path: &Path) -> bool {
 }
 
 fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
-    let WorktreeCommand::Create {
-        project,
-        branch,
-        name,
-    } = command;
+    match command {
+        WorktreeCommand::Create {
+            project,
+            branch,
+            name,
+        } => worktree_create(project, branch, name, paths),
+        WorktreeCommand::Remove { project, force } => worktree_remove(&project, force, paths),
+    }
+}
+
+fn worktree_create(
+    project: String,
+    branch: String,
+    name: Option<String>,
+    paths: &Paths,
+) -> Result<()> {
     let mut config = load_config(paths)?;
     let available = available_projects(&config)?;
     let primary = get_project(&available, &project)?;
@@ -1245,11 +1262,7 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
         .join(&primary.name);
     validate_branch(&primary.path, &branch)?;
     let worktree_name = name.unwrap_or_else(|| default_worktree_name(&project, &branch));
-    if config
-        .projects
-        .iter()
-        .any(|registered| registered.name == worktree_name)
-    {
+    if !project_name_available(&config, &worktree_name)? {
         bail!(
             "a project named '{worktree_name}' is already registered; use --name to choose an alias"
         );
@@ -1291,6 +1304,43 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn worktree_remove(name: &str, force: bool, paths: &Paths) -> Result<()> {
+    let mut config = load_config(paths)?;
+    let available = available_projects(&config)?;
+    let worktree = get_project(&available, name)?;
+    if !worktree.is_worktree {
+        bail!("'{name}' is not a worktree; devx only removes worktrees");
+    }
+    if is_dirty(&worktree.path) && !force {
+        bail!("'{name}' has uncommitted changes; rerun with --force to remove it");
+    }
+    let primary_name = worktree.template_name();
+    let primary = available
+        .iter()
+        .find(|project| project.name == primary_name && !project.is_worktree)
+        .with_context(|| format!("cannot find primary project '{primary_name}'"))?;
+    let mut arguments = vec!["worktree", "remove"];
+    if force {
+        arguments.push("--force");
+    }
+    arguments.push(
+        worktree
+            .path
+            .to_str()
+            .context("worktree path is not UTF-8")?,
+    );
+    run_git_vec(&primary.path, &arguments)?;
+    config
+        .projects
+        .retain(|project| project.path != worktree.path);
+    config
+        .cached_projects
+        .retain(|project| project.path != worktree.path);
+    save_config(paths, &config)?;
+    println!("Removed worktree {name}\n  {}", worktree.path.display());
+    Ok(())
+}
+
 fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
@@ -1299,15 +1349,156 @@ fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
         launch(&config.launchers.editor, &project.path, "editor")?;
     }
     if !args.no_terminal {
-        launch(&config.launchers.terminal, &project.path, "terminal")?;
+        if args.workspace && config.workspace.enabled {
+            launch_workspace(&config, project)?;
+        } else {
+            launch(&config.launchers.terminal, &project.path, "terminal")?;
+        }
     }
     Ok(())
+}
+
+fn workspace(args: WorkspaceArgs, paths: &Paths) -> Result<()> {
+    let mut config = load_config(paths)?;
+    if args.configure {
+        configure_workspace(&mut config)?;
+        save_config(paths, &config)?;
+        println!("Updated workspace settings.");
+        return Ok(());
+    }
+    let name = args
+        .name
+        .context("provide a project name or use --configure")?;
+    let projects = available_projects(&config)?;
+    let project = get_project(&projects, &name)?;
+    launch_workspace(&config, project)
+}
+
+fn configure_workspace(config: &mut Config) -> Result<()> {
+    let enabled = Confirm::new()
+        .with_prompt("Use the terminal workspace by default from devx pick?")
+        .default(config.workspace.enabled)
+        .interact()?;
+    config.workspace.enabled = enabled;
+    if !enabled {
+        println!("Picker selections will use normal terminal opens.");
+        return Ok(());
+    }
+    let current = config.workspace.vcs.join(" ");
+    let command: String = Input::new()
+        .with_prompt("VCS command for the workspace")
+        .default(current)
+        .interact_text()?;
+    let command: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+    if command.is_empty() {
+        bail!("workspace VCS command cannot be empty");
+    }
+    config.workspace.vcs = command;
+    let terminal = launcher_application(&config.launchers.terminal).unwrap_or("custom");
+    if terminal == "Ghostty" {
+        println!("Ghostty workspace\n  Native split: shell left, VCS right.");
+    } else if command_exists("tmux")
+        && config
+            .launchers
+            .terminal
+            .iter()
+            .any(|argument| argument.contains("{command}"))
+    {
+        println!("{terminal} workspace\n  tmux split: shell left, VCS right.");
+    } else {
+        println!(
+            "{terminal} workspace\n  Normal terminal fallback.\n  Add {{command}} to its launcher and install tmux for splits."
+        );
+    }
+    Ok(())
+}
+
+fn launch_workspace(config: &Config, project: &Project) -> Result<()> {
+    if !config.workspace.enabled {
+        return launch(&config.launchers.terminal, &project.path, "terminal");
+    }
+    let vcs = config
+        .workspace
+        .vcs
+        .first()
+        .context("workspace VCS command is empty")?;
+    if !command_exists(vcs) {
+        println!("Workspace VCS is unavailable\n  {vcs}\n\nOpening a normal terminal instead.");
+        return launch(&config.launchers.terminal, &project.path, "terminal");
+    }
+    if launcher_application(&config.launchers.terminal) == Some("Ghostty") {
+        return launch_ghostty_workspace(&project.path, &vcs_command(&config.workspace.vcs));
+    }
+    if command_exists("tmux")
+        && config
+            .launchers
+            .terminal
+            .iter()
+            .any(|argument| argument.contains("{command}"))
+    {
+        return launch_tmux_workspace(
+            &config.launchers.terminal,
+            &project.path,
+            &vcs_command(&config.workspace.vcs),
+        );
+    }
+    println!(
+        "Terminal workspace is unavailable\n  Configure a terminal launcher with {{command}} to use tmux.\n\nOpening a normal terminal instead."
+    );
+    launch(&config.launchers.terminal, &project.path, "terminal")
+}
+
+fn vcs_command(vcs: &[String]) -> String {
+    vcs.iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
+    let working_directory = apple_script_quote(&path.to_string_lossy());
+    let command = apple_script_quote(&format!("exec {vcs}"));
+    let script = format!(
+        "tell application \"Ghostty\"\n\
+           set config to new surface configuration\n\
+           set initial to new window with configuration {{initial working directory:{working_directory}}}\n\
+           split (focused terminal of selected tab of initial) direction right with configuration {{initial working directory:{working_directory}, command:{command}}}\n\
+           activate\n\
+         end tell"
+    );
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("could not start osascript for Ghostty workspace")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "Ghostty workspace failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn launch_tmux_workspace(terminal: &[String], path: &Path, vcs: &str) -> Result<()> {
+    let command = format!(
+        "tmux new-session -A -s devx -c {} \\; split-window -h -c {} '{}' \\; select-pane -L",
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&path.to_string_lossy()),
+        vcs
+    );
+    launch_command(terminal, &command, "terminal workspace")
+}
+
+fn apple_script_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn config(command: ConfigCommand, paths: &Paths) -> Result<()> {
     let app = load_config(paths)?;
     match command {
         ConfigCommand::Apply { project } => config_apply(paths, &project),
+        ConfigCommand::Search { project, query } => config_search(paths, &project, &query),
         ConfigCommand::List { project } => {
             let projects = available_projects(&app)?;
             let registered = get_project(&projects, &project)?;
@@ -1332,6 +1523,52 @@ fn config(command: ConfigCommand, paths: &Paths) -> Result<()> {
         }
         ConfigCommand::GlobalAdd => config_global_add(paths),
     }
+}
+
+fn config_search(paths: &Paths, project: &str, query: &str) -> Result<()> {
+    let config = load_config(paths)?;
+    let projects = available_projects(&config)?;
+    let registered = get_project(&projects, project)?;
+    let files: Vec<_> = config
+        .managed_files
+        .iter()
+        .filter(|file| file.project == registered.template_name())
+        .flat_map(|file| {
+            [
+                registered.path.join(&file.destination),
+                paths.global_overlays_dir().join(&file.destination),
+                paths.overlays_dir(&file.project).join(&file.destination),
+            ]
+        })
+        .filter(|path| path.exists())
+        .collect();
+    if files.is_empty() {
+        bail!("no mapped configuration files found for {project}");
+    }
+    let output = Command::new("rg")
+        .args([
+            "--ignore-case",
+            "--line-number",
+            "--with-filename",
+            "--color",
+            "always",
+            query,
+        ])
+        .args(&files)
+        .output()
+        .context("could not start rg; install it with 'brew install ripgrep'")?;
+    if output.status.code() == Some(1) {
+        println!("No matches for '{query}'.");
+        return Ok(());
+    }
+    if !output.status.success() {
+        bail!(
+            "rg failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
 }
 
 fn config_apply(paths: &Paths, project: &str) -> Result<()> {
@@ -2153,6 +2390,10 @@ fn worktree_directory_name(branch: &str) -> String {
 }
 
 fn run_git<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<()> {
+    run_git_vec(repository, &arguments)
+}
+
+fn run_git_vec(repository: &Path, arguments: &[&str]) -> Result<()> {
     let output = Command::new("git")
         .args(arguments)
         .current_dir(repository)
@@ -2275,6 +2516,7 @@ mod tests {
             roots: Vec::new(),
             usage: HashMap::new(),
             launchers: Launchers::default(),
+            workspace: Default::default(),
             managed_files: Vec::new(),
             cached_projects: Vec::new(),
             cache_initialized: false,
@@ -2534,5 +2776,65 @@ mod tests {
             is_worktree: false,
         };
         assert!(project_picker_entry(&&project, true).ends_with("\t/Users/example/dev/api"));
+    }
+
+    #[test]
+    fn worktree_remove_refuses_dirty_without_force() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".git")).unwrap();
+        fs::write(directory.path().join("changed.txt"), "changed").unwrap();
+        let project = Project {
+            name: "feature".into(),
+            path: directory.path().to_owned(),
+            template_project: Some("primary".into()),
+            branch: Some("feature".into()),
+            is_worktree: true,
+        };
+        assert!(project.is_worktree);
+        assert!(is_dirty(&project.path));
+    }
+
+    #[test]
+    fn config_search_includes_base_and_both_overlay_layers() {
+        let paths = Paths {
+            config_dir: PathBuf::from("/tmp/devx"),
+        };
+        let project = Project {
+            name: "api".into(),
+            path: PathBuf::from("/tmp/api"),
+            template_project: None,
+            branch: None,
+            is_worktree: false,
+        };
+        let file = ManagedFile {
+            project: "api".into(),
+            destination: PathBuf::from("src/bootstrap.yml"),
+        };
+        let candidates = [
+            project.path.join(&file.destination),
+            paths.global_overlays_dir().join(&file.destination),
+            paths.overlays_dir(&file.project).join(&file.destination),
+        ];
+        assert_eq!(candidates[0], PathBuf::from("/tmp/api/src/bootstrap.yml"));
+        assert_eq!(
+            candidates[1],
+            PathBuf::from("/tmp/devx/configs/global/src/bootstrap.yml")
+        );
+        assert_eq!(
+            candidates[2],
+            PathBuf::from("/tmp/devx/configs/api/src/bootstrap.yml")
+        );
+    }
+
+    #[test]
+    fn workspace_defaults_to_enabled_lazygit() {
+        let config = Config::default();
+        assert!(config.workspace.enabled);
+        assert_eq!(config.workspace.vcs, ["lazygit"]);
+    }
+
+    #[test]
+    fn quotes_vcs_tokens_for_workspace_shell_commands() {
+        assert_eq!(vcs_command(&["git".into(), "gui".into()]), "'git' 'gui'");
     }
 }
