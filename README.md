@@ -254,14 +254,16 @@ moving or modifying them.
 
 `devx` keeps local configuration outside repositories. Set up a project once;
 with no project name, `fzf` first selects a checkout and then one or more
-existing `.yml`, `.yaml`, `.properties`, or `.env` files:
+supported configuration files found recursively in the primary repository:
 
 ```sh
 devx project setup my-service
 devx project setup
 ```
 
-For every selected project file, setup creates empty overlays in both layers
+The picker searches `.yml`, `.yaml`, `.properties`, and `.env` files and supports
+selecting multiple files with `TAB`. For every selected project file, setup
+creates empty overlays in both layers
 and opens the project overlay directory in Zed by default:
 
 ```text
@@ -344,6 +346,6 @@ This writes `devx-pick.sh` under
 `~/Library/Application Support/Raycast/Script Commands/devx`. Add that
 directory in Raycast Settings, Extensions, Script Commands, Add Directory.
 Search for **Devx Pick**, then assign a Raycast hotkey. The script opens the
-cached `devx pick` flow using `[launchers].raycast_terminal` and resolves
-`devx` from Raycast's `PATH`, falling back to `~/.cargo/bin/devx`. Its default
-is Ghostty; change that launcher to use another terminal.
+cached `devx pick` flow using `[launchers].raycast_terminal` and runs the
+binary at `~/Scripts/devx`. Its default is Ghostty; change that launcher to use
+another terminal.

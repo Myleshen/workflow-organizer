@@ -8,12 +8,9 @@
 
 set -euo pipefail
 
-if (( $+commands[devx] )); then
-  devx_path="$(command -v devx)"
-elif [[ -x "$HOME/.cargo/bin/devx" ]]; then
-  devx_path="$HOME/.cargo/bin/devx"
-else
-  print -u2 "devx is not installed. Run: cargo install --path /path/to/devx"
+devx_path="$HOME/Scripts/devx"
+if [[ ! -x "$devx_path" ]]; then
+  print -u2 "devx is not installed at $devx_path"
   exit 1
 fi
 

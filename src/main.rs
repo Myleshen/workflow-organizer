@@ -214,15 +214,20 @@ fn default_config_editor() -> Vec<String> {
 }
 
 fn default_raycast_terminal() -> Vec<String> {
+    raycast_terminal_launcher("Ghostty")
+}
+
+fn raycast_terminal_launcher(application: &str) -> Vec<String> {
     vec![
         "open".into(),
+        "-n".into(),
         "-a".into(),
-        "Ghostty".into(),
+        application.into(),
         "--args".into(),
         "-e".into(),
         "zsh".into(),
         "-lc".into(),
-        "exec {command}".into(),
+        "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status".into(),
     ]
 }
 
@@ -416,7 +421,7 @@ fn raycast_pick() -> Result<()> {
     let paths = Paths::from_environment()?;
     let config = load_config(&paths)?;
     let executable = env::current_exe().context("cannot determine the devx executable path")?;
-    let command = format!("exec {} pick", shell_quote(&executable.to_string_lossy()));
+    let command = format!("{} pick", shell_quote(&executable.to_string_lossy()));
     launch_command(
         &config.launchers.raycast_terminal,
         &command,
@@ -580,16 +585,38 @@ fn pick_open(paths: &Paths) -> Result<()> {
     let Some(name) = select_project("Choose a checkout", &checkouts)? else {
         return Ok(());
     };
-    open(
-        OpenArgs {
-            name: name.clone(),
-            no_editor: false,
-            no_terminal: false,
-            workspace: config.workspace.enabled,
-        },
-        paths,
-    )?;
+    let Some(editor) = pick_editor(&config)? else {
+        return Ok(());
+    };
+    let project = get_project(&available, &name)?;
+    launch(&editor, &project.path, "editor")?;
+    launch_workspace(&config, project)?;
     record_open(&mut config, &name, paths)
+}
+
+fn pick_editor(config: &Config) -> Result<Option<Vec<String>>> {
+    let choices = [
+        (
+            "editor",
+            launcher_application(&config.launchers.editor).unwrap_or("IDE/editor"),
+        ),
+        (
+            "config_editor",
+            launcher_application(&config.launchers.config_editor).unwrap_or("configuration editor"),
+        ),
+    ];
+    let rows = choices
+        .iter()
+        .map(|(identifier, application)| format!("{identifier}\t{application}"))
+        .collect::<Vec<_>>();
+    let Some(choice) = select_table("Choose an editor", "APPLICATION", &rows)? else {
+        return Ok(None);
+    };
+    Ok(Some(if choice == "editor" {
+        config.launchers.editor.clone()
+    } else {
+        config.launchers.config_editor.clone()
+    }))
 }
 
 struct ProjectGroup<'a> {
@@ -655,14 +682,10 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
     let branch: String = Input::new()
         .with_prompt("New branch name")
         .interact_text()?;
-    worktree(
-        WorktreeCommand::Create {
-            project,
-            branch,
-            name: None,
-        },
-        paths,
-    )
+    let Some(editor) = pick_editor(&config)? else {
+        return Ok(());
+    };
+    worktree_create(project, branch, None, Some(editor), paths)
 }
 
 fn pick_remove_worktree(paths: &Paths) -> Result<()> {
@@ -706,8 +729,25 @@ fn pick_config(paths: &Paths) -> Result<()> {
         );
         return Ok(());
     }
-    let projects: Vec<_> = available.iter().collect();
-    let Some(project) = select_project("Choose a project", &projects)? else {
+    let groups = project_groups(&available, &config.usage);
+    let Some(repository) = select_table(
+        "Choose a project",
+        "PROJECT\tCHECKOUTS",
+        &groups
+            .iter()
+            .map(|group| format!("{}\t{}\t{}", group.name, group.name, group.projects.len()))
+            .collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(());
+    };
+    let group = groups
+        .iter()
+        .find(|group| group.name == repository)
+        .context("selected project group is no longer available")?;
+    let mut checkouts = group.projects.clone();
+    checkouts.sort_by(|left, right| checkout_sort_key(left).cmp(&checkout_sort_key(right)));
+    let Some(project) = select_project("Choose a checkout", &checkouts)? else {
         return Ok(());
     };
     config_apply(paths, &project)
@@ -1101,16 +1141,7 @@ fn choose_launcher(
         return Ok(());
     }
     *launcher = if raycast {
-        vec![
-            "open".into(),
-            "-a".into(),
-            choice,
-            "--args".into(),
-            "-e".into(),
-            "zsh".into(),
-            "-lc".into(),
-            "exec {command}".into(),
-        ]
+        raycast_terminal_launcher(&choice)
     } else {
         vec!["open".into(), "-a".into(), choice, "{path}".into()]
     };
@@ -1548,7 +1579,7 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
             project,
             branch,
             name,
-        } => worktree_create(project, branch, name, paths),
+        } => worktree_create(project, branch, name, None, paths),
         WorktreeCommand::Remove {
             project,
             force,
@@ -1561,6 +1592,7 @@ fn worktree_create(
     project: String,
     branch: String,
     name: Option<String>,
+    editor: Option<Vec<String>>,
     paths: &Paths,
 ) -> Result<()> {
     let mut config = load_config(paths)?;
@@ -1595,6 +1627,7 @@ fn worktree_create(
         [
             "worktree",
             "add",
+            "--no-track",
             "-b",
             &branch,
             &destination.to_string_lossy(),
@@ -1627,7 +1660,11 @@ fn worktree_create(
         "Created and registered {worktree_name}\n  {}",
         destination.display()
     );
-    launch_after_mutation(&config.launchers.editor, &destination, "editor");
+    launch_after_mutation(
+        editor.as_deref().unwrap_or(&config.launchers.editor),
+        &destination,
+        "editor",
+    );
     launch_after_mutation(&config.launchers.terminal, &destination, "terminal");
     Ok(())
 }
@@ -1875,16 +1912,7 @@ fn vcs_command(vcs: &[String]) -> String {
 }
 
 fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
-    let working_directory = apple_script_quote(&path.to_string_lossy());
-    let command = apple_script_quote(&format!("exec {vcs}"));
-    let script = format!(
-        "tell application \"Ghostty\"\n\
-           set config to new surface configuration\n\
-           set initial to new window with configuration {{initial working directory:{working_directory}}}\n\
-           split (focused terminal of selected tab of initial) direction right with configuration {{initial working directory:{working_directory}, command:{command}}}\n\
-           activate\n\
-         end tell"
-    );
+    let script = ghostty_workspace_script(path, vcs);
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
@@ -1897,6 +1925,19 @@ fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn ghostty_workspace_script(path: &Path, vcs: &str) -> String {
+    let working_directory = apple_script_quote(&path.to_string_lossy());
+    let command = apple_script_quote(vcs);
+    format!(
+        "tell application \"Ghostty\"\n\
+           set config to new surface configuration\n\
+           set initial to new window with configuration {{initial working directory:{working_directory}}}\n\
+           split (focused terminal of selected tab of initial) direction right with configuration {{initial working directory:{working_directory}, command:{command}}}\n\
+           activate\n\
+         end tell"
+    )
 }
 
 fn launch_tmux_workspace(terminal: &[String], path: &Path, vcs: &str) -> Result<()> {
@@ -2382,7 +2423,10 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
     let project = match project {
         Some(project) => project,
         None => {
-            let projects: Vec<_> = available.iter().collect();
+            let projects: Vec<_> = available
+                .iter()
+                .filter(|project| project.template_project.is_none())
+                .collect();
             let Some(project) = select_project("Choose a project", &projects)? else {
                 return Ok(());
             };
@@ -2390,8 +2434,11 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
         }
     };
     let selected = get_project(&available, &project)?;
+    if selected.template_project.is_some() {
+        bail!("'{project}' is a worktree; configure overlays from its primary project instead");
+    }
     println!(
-        "Discovering configuration files in {}...",
+        "Discovering supported configuration files in {}...",
         selected.path.display()
     );
     let candidates = discover_config_files(&selected.path)?;
@@ -2409,7 +2456,10 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
         .iter()
         .map(|path| path.display().to_string())
         .collect();
-    let selected_files = select_many("Select files to manage", &choices)?;
+    let selected_files = select_many(
+        "Select files to manage (TAB selects, ENTER confirms)",
+        &choices,
+    )?;
     if selected_files.is_empty() {
         println!("No configuration files selected.");
         return Ok(());
@@ -3035,7 +3085,7 @@ fn select_many(prompt: &str, choices: &[String]) -> Result<Vec<String>> {
             "--prompt",
             &format!("{prompt}> "),
             "--height",
-            "~40%",
+            "~70%",
             "--multi",
             "--ignore-case",
         ])
@@ -3085,7 +3135,7 @@ fn launch_command(template: &[String], command: &str, kind: &str) -> Result<()> 
 }
 
 fn fetch_default_branch(repository: &Path) -> Result<String> {
-    run_git(repository, ["fetch", "--prune", "origin"])?;
+    run_git(repository, ["fetch", "origin"])?;
     let reference = git_output(
         repository,
         [
@@ -3200,8 +3250,24 @@ fn load_config(paths: &Paths) -> Result<Config> {
     }
     let mut config: Config = toml::from_str(&fs::read_to_string(&file)?)
         .with_context(|| format!("invalid configuration in {}", file.display()))?;
+    let legacy_raycast_terminal: Vec<String> = vec![
+        "open".into(),
+        "-a".into(),
+        "Ghostty".into(),
+        "--args".into(),
+        "-e".into(),
+        "zsh".into(),
+        "-lc".into(),
+        "exec {command}".into(),
+    ];
+    let launcher_migrated = config.launchers.raycast_terminal == legacy_raycast_terminal;
+    if launcher_migrated {
+        config.launchers.raycast_terminal = default_raycast_terminal();
+    }
     if !config.cache_initialized {
         refresh_project_cache(&mut config)?;
+        save_config(paths, &config)?;
+    } else if launcher_migrated {
         save_config(paths, &config)?;
     }
     Ok(config)
@@ -3896,7 +3962,59 @@ mod tests {
     }
 
     #[test]
+    fn default_raycast_terminal_runs_the_picker_once_and_keeps_failures_visible() {
+        let launcher = default_raycast_terminal();
+        let command = launcher.last().unwrap();
+        assert_eq!(&launcher[..4], ["open", "-n", "-a", "Ghostty"]);
+        assert_eq!(
+            command,
+            "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status"
+        );
+        assert!(!command.contains("exec {command}"));
+    }
+
+    #[test]
+    fn load_config_migrates_the_legacy_raycast_launcher() {
+        let directory = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        let mut config = Config {
+            cache_initialized: true,
+            ..Config::default()
+        };
+        config.launchers.raycast_terminal = vec![
+            "open".into(),
+            "-a".into(),
+            "Ghostty".into(),
+            "--args".into(),
+            "-e".into(),
+            "zsh".into(),
+            "-lc".into(),
+            "exec {command}".into(),
+        ];
+        save_config(&paths, &config).unwrap();
+
+        let loaded = load_config(&paths).unwrap();
+
+        assert_eq!(
+            loaded.launchers.raycast_terminal,
+            default_raycast_terminal()
+        );
+        let saved: Config =
+            toml::from_str(&fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(saved.launchers.raycast_terminal, default_raycast_terminal());
+    }
+
+    #[test]
     fn quotes_vcs_tokens_for_workspace_shell_commands() {
         assert_eq!(vcs_command(&["git".into(), "gui".into()]), "'git' 'gui'");
+    }
+
+    #[test]
+    fn ghostty_workspace_does_not_prefix_the_vcs_command_with_exec() {
+        let script = ghostty_workspace_script(Path::new("/tmp/project"), "'lazygit'");
+        assert!(script.contains("command:\"'lazygit'\""));
+        assert!(!script.contains("command:\"exec "));
     }
 }
