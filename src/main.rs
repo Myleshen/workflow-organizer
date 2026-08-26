@@ -1621,6 +1621,7 @@ fn worktree_create(
 
     println!("Fetching origin for worktree {worktree_name}...");
     let default_branch = fetch_default_branch(&primary.path)?;
+    update_primary_default_branch(&primary.path, &default_branch)?;
     println!("Creating worktree at {}...", destination.display());
     run_git(
         &primary.path,
@@ -3136,21 +3137,51 @@ fn launch_command(template: &[String], command: &str, kind: &str) -> Result<()> 
 
 fn fetch_default_branch(repository: &Path) -> Result<String> {
     run_git(repository, ["fetch", "origin"])?;
-    let reference = git_output(
+    let output = Command::new("git")
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .context("could not query origin's default branch")?;
+    if !output.status.success() {
+        bail!(
+            "could not determine origin's default branch in {}: {}",
+            repository.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let output = String::from_utf8(output.stdout).context("git returned non-UTF-8 output")?;
+    let reference = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: "))
+        .and_then(|line| line.split_once('\t'))
+        .map(|(reference, _)| reference)
+        .and_then(|reference| reference.strip_prefix("refs/heads/"));
+    let branch = reference.context("origin has no default branch")?;
+    let remote_branch = format!("refs/remotes/origin/{branch}");
+    run_git(
         repository,
-        [
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
+        ["rev-parse", "--verify", "--quiet", &remote_branch],
     )?;
-    reference
-        .strip_prefix("origin/")
-        .map(str::to_owned)
-        .context(
-        "origin has no default branch; run 'git remote set-head origin -a' in the primary checkout",
-    )
+    Ok(branch.to_owned())
+}
+
+fn update_primary_default_branch(repository: &Path, default_branch: &str) -> Result<()> {
+    let branch = git_branch(repository).context(
+        "the primary checkout is detached; check out origin's default branch before creating a worktree",
+    )?;
+    if branch != default_branch {
+        bail!(
+            "the primary checkout is on '{branch}', not origin's default branch '{default_branch}'; check out '{default_branch}' before creating a worktree"
+        );
+    }
+    if is_dirty(repository) {
+        bail!(
+            "the primary checkout has uncommitted changes; commit, stash, or discard them before creating a worktree"
+        );
+    }
+    let remote_branch = format!("origin/{default_branch}");
+    run_git(repository, ["merge", "--ff-only", &remote_branch])
+        .context("could not fast-forward the primary checkout before creating the worktree")
 }
 
 fn validate_branch(repository: &Path, branch: &str) -> Result<()> {
@@ -3652,6 +3683,42 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    #[test]
+    fn fetches_remote_default_branch_without_local_origin_head() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let remote = directory.path().join("remote.git");
+        let clone = directory.path().join("clone");
+        fs::create_dir(&source).unwrap();
+        run_git(&source, ["init", "--initial-branch", "main"]).unwrap();
+        run_git(&source, ["config", "user.email", "devx@example.test"]).unwrap();
+        run_git(&source, ["config", "user.name", "devx test"]).unwrap();
+        fs::write(source.join("README"), "test\n").unwrap();
+        run_git(&source, ["add", "README"]).unwrap();
+        run_git(&source, ["commit", "-m", "initial"]).unwrap();
+        run_git(&source, ["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        run_git(
+            &source,
+            ["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&source, ["push", "origin", "main"]).unwrap();
+        run_git(
+            &source,
+            ["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&clone, ["remote", "set-head", "origin", "--delete"]).unwrap();
+
+        assert_eq!(fetch_default_branch(&clone).unwrap(), "main");
+        update_primary_default_branch(&clone, "main").unwrap();
+        assert_eq!(git_branch(&clone).as_deref(), Some("main"));
+        assert_eq!(
+            git_output(&clone, ["rev-parse", "HEAD"]).unwrap(),
+            git_output(&clone, ["rev-parse", "origin/main"]).unwrap()
         );
     }
 
