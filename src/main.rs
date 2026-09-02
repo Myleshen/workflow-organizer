@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
-    thread,
+    thread::{self},
     time::{Duration, Instant},
 };
 
@@ -34,6 +34,8 @@ enum Commands {
     Init,
     /// Interactively configure applications, scan roots, cache, and Raycast.
     Setup,
+    /// Interactively edit current applications, workspace, and scan roots.
+    Edit,
     /// Remove all devx local configuration after confirmation.
     Reset {
         /// Confirm removal without an interactive prompt.
@@ -247,6 +249,7 @@ fn run(command: Commands, paths: &Paths) -> Result<()> {
     match command {
         Commands::Init => init(paths),
         Commands::Setup => setup(paths),
+        Commands::Edit => edit(paths),
         Commands::Reset { yes } => reset(paths, yes),
         Commands::Man => show_man_page(),
         Commands::Doctor => doctor(paths),
@@ -535,10 +538,12 @@ fn pick(paths: &Paths) -> Result<()> {
         "Choose an action",
         &[
             "Open project or worktree".to_owned(),
+            "Clone repository".to_owned(),
             "Create worktree".to_owned(),
             "Remove worktree".to_owned(),
             "Set up configuration overlays".to_owned(),
             "Apply configuration overlays".to_owned(),
+            "Refresh Worktrees".to_owned(),
         ],
     )?
     else {
@@ -547,12 +552,91 @@ fn pick(paths: &Paths) -> Result<()> {
 
     match action.as_str() {
         "Open project or worktree" => pick_open(paths),
+        "Clone repository" => pick_clone(paths),
         "Create worktree" => pick_worktree(paths),
         "Remove worktree" => pick_remove_worktree(paths),
         "Set up configuration overlays" => project_setup(None, paths),
         "Apply configuration overlays" => pick_config(paths),
+        "Refresh Worktrees" => pick_refresh(paths),
         _ => unreachable!("picker returned an unknown action"),
     }
+}
+
+fn pick_clone(paths: &Paths) -> Result<()> {
+    let mut config = load_config(paths)?;
+    if config.roots.is_empty() {
+        println!("No scan roots are configured. Run: devx setup or devx project add-root <path>");
+        return Ok(());
+    }
+    let roots = config
+        .roots
+        .iter()
+        .map(|root| format!("{}\t{}", root.name, root.path.display()))
+        .collect::<Vec<_>>();
+    let Some(root) = select_table("Choose a scan root", "ROOT\tLOCATION", &roots)? else {
+        return Ok(());
+    };
+    let url: String = Input::new()
+        .with_prompt("Git repository URL")
+        .interact_text()?;
+    let destination = clone_project(&config, &root, &url)?;
+    println!("Refreshing project cache...");
+    let refresh_error = refresh_project_cache(&mut config)
+        .and_then(|()| save_config(paths, &config))
+        .err();
+    if let Some(error) = &refresh_error {
+        eprintln!(
+            "warning: repository was cloned, but the project cache could not be refreshed: {error}\n  Refresh with: devx project refresh"
+        );
+    }
+
+    let project = available_projects(&config)
+        .ok()
+        .and_then(|projects| {
+            projects
+                .into_iter()
+                .find(|project| project.path == destination)
+        })
+        .unwrap_or_else(|| Project {
+            name: destination
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "cloned-repository".to_owned()),
+            path: destination.clone(),
+            template_project: None,
+            branch: None,
+            is_worktree: false,
+        });
+    if let Err(error) = launch(&config.launchers.editor, &project.path, "editor") {
+        eprintln!(
+            "warning: repository was cloned, but it could not be opened: {error}\n  Open manually: {}",
+            project.path.display()
+        );
+    }
+    if let Err(error) = launch_workspace(&config, &project) {
+        eprintln!(
+            "warning: repository was cloned, but the terminal workspace could not be opened: {error}\n  Open manually: {}",
+            project.path.display()
+        );
+    }
+    if refresh_error.is_none()
+        && let Err(error) = record_open(&mut config, &project.name, paths)
+    {
+        eprintln!("warning: repository was cloned, but usage could not be recorded: {error}");
+    }
+    Ok(())
+}
+
+fn pick_refresh(paths: &Paths) -> Result<()> {
+    let mut config = load_config(paths)?;
+    refresh_project_cache(&mut config)?;
+    save_config(paths, &config)?;
+    println!(
+        "Refreshed project cache\n  {} project(s)",
+        config.cached_projects.len()
+    );
+    thread::sleep(Duration::from_secs(2)); // Give the user a moment to see the message before the
+    Ok(())
 }
 
 fn pick_open(paths: &Paths) -> Result<()> {
@@ -585,38 +669,9 @@ fn pick_open(paths: &Paths) -> Result<()> {
     let Some(name) = select_project("Choose a checkout", &checkouts)? else {
         return Ok(());
     };
-    let Some(editor) = pick_editor(&config)? else {
-        return Ok(());
-    };
     let project = get_project(&available, &name)?;
-    launch(&editor, &project.path, "editor")?;
-    launch_workspace(&config, project)?;
+    launch_for_picker(&config, project)?;
     record_open(&mut config, &name, paths)
-}
-
-fn pick_editor(config: &Config) -> Result<Option<Vec<String>>> {
-    let choices = [
-        (
-            "editor",
-            launcher_application(&config.launchers.editor).unwrap_or("IDE/editor"),
-        ),
-        (
-            "config_editor",
-            launcher_application(&config.launchers.config_editor).unwrap_or("configuration editor"),
-        ),
-    ];
-    let rows = choices
-        .iter()
-        .map(|(identifier, application)| format!("{identifier}\t{application}"))
-        .collect::<Vec<_>>();
-    let Some(choice) = select_table("Choose an editor", "APPLICATION", &rows)? else {
-        return Ok(None);
-    };
-    Ok(Some(if choice == "editor" {
-        config.launchers.editor.clone()
-    } else {
-        config.launchers.config_editor.clone()
-    }))
 }
 
 struct ProjectGroup<'a> {
@@ -682,10 +737,7 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
     let branch: String = Input::new()
         .with_prompt("New branch name")
         .interact_text()?;
-    let Some(editor) = pick_editor(&config)? else {
-        return Ok(());
-    };
-    worktree_create(project, branch, None, Some(editor), paths)
+    worktree_create(project, branch, None, paths)
 }
 
 fn pick_remove_worktree(paths: &Paths) -> Result<()> {
@@ -750,7 +802,29 @@ fn pick_config(paths: &Paths) -> Result<()> {
     let Some(project) = select_project("Choose a checkout", &checkouts)? else {
         return Ok(());
     };
-    config_apply(paths, &project)
+    let selected_project = get_project(&available, &project)?;
+    let copy_files = discover_copy_files(&paths.global_overlays_dir())?;
+    let selected_copy_files = if copy_files.is_empty() {
+        Vec::new()
+    } else {
+        println!("Global copy files are available outside src.");
+        select_many(
+            "Select files to copy (TAB selects, ENTER confirms; ESC skips)",
+            &copy_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        )?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    };
+    if !configured_overlay_destinations(paths, &config, selected_project)?.is_empty() {
+        config_apply(paths, &project)?;
+    } else {
+        println!("No overlay files configured for {project}; continuing with global copies.");
+    }
+    copy_global_files(paths, &project, &selected_copy_files)
 }
 
 fn init(paths: &Paths) -> Result<()> {
@@ -811,6 +885,24 @@ fn setup(paths: &Paths) -> Result<()> {
     }
     println!("\nSetup complete\n  Run: devx doctor");
     print_recommended_tools(&config);
+    Ok(())
+}
+
+fn edit(paths: &Paths) -> Result<()> {
+    let mut config = load_config(paths)?;
+    configure_launchers(&mut config)?;
+    configure_workspace(&mut config)?;
+    if !config.roots.is_empty() {
+        println!("Current scan roots:");
+        for root in &config.roots {
+            println!("  {}\t{}", root.name, root.path.display());
+        }
+    }
+    configure_roots(&mut config)?;
+    save_config(paths, &config)?;
+    refresh_project_cache(&mut config)?;
+    save_config(paths, &config)?;
+    println!("Updated devx settings.");
     Ok(())
 }
 
@@ -1333,12 +1425,13 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<()> {
+fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<PathBuf> {
     let root = config
         .roots
         .iter()
         .find(|root| root.name == root_name)
         .with_context(|| format!("no scan root named '{root_name}' is registered"))?;
+    let url = url.trim();
     let repository_name = repository_name_from_url(url)?;
     let destination = root.path.join(&repository_name);
     if destination.exists() {
@@ -1347,7 +1440,7 @@ fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<()> {
     let destination = destination.to_string_lossy();
     run_command("git", ["clone", url, &destination], None)?;
     println!("Cloned {repository_name}\n  {}", root.path.display());
-    Ok(())
+    Ok(destination.into_owned().into())
 }
 
 fn repository_name_from_url(url: &str) -> Result<String> {
@@ -1382,7 +1475,16 @@ fn project_name_available(config: &Config, name: &str) -> Result<bool> {
 }
 
 fn refresh_project_cache(config: &mut Config) -> Result<()> {
-    config.cached_projects = expand_worktrees(discover_projects(&config.roots)?)?;
+    let discovered = expand_worktrees(discover_projects(&config.roots)?)?;
+    let discovered_worktree_paths: HashSet<_> = discovered
+        .iter()
+        .filter(|project| project.is_worktree)
+        .map(|project| &project.path)
+        .collect();
+    config.projects.retain(|project| {
+        !project.is_worktree || discovered_worktree_paths.contains(&project.path)
+    });
+    config.cached_projects = discovered;
     let registered_paths: HashSet<_> = config
         .projects
         .iter()
@@ -1570,7 +1672,28 @@ fn discover_projects_in(
 }
 
 fn is_git_checkout(path: &Path) -> bool {
-    path.join(".git").exists()
+    let git_path = path.join(".git");
+    match fs::metadata(&git_path) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => fs::read_to_string(&git_path)
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .strip_prefix("gitdir: ")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+            .map(PathBuf::from)
+            .map(|gitdir| {
+                if gitdir.is_absolute() {
+                    gitdir
+                } else {
+                    path.join(gitdir)
+                }
+            })
+            .is_some_and(|gitdir| gitdir.is_dir()),
+        Err(_) => false,
+    }
 }
 
 fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
@@ -1579,7 +1702,7 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
             project,
             branch,
             name,
-        } => worktree_create(project, branch, name, None, paths),
+        } => worktree_create(project, branch, name, paths),
         WorktreeCommand::Remove {
             project,
             force,
@@ -1592,7 +1715,6 @@ fn worktree_create(
     project: String,
     branch: String,
     name: Option<String>,
-    editor: Option<Vec<String>>,
     paths: &Paths,
 ) -> Result<()> {
     let mut config = load_config(paths)?;
@@ -1661,12 +1783,8 @@ fn worktree_create(
         "Created and registered {worktree_name}\n  {}",
         destination.display()
     );
-    launch_after_mutation(
-        editor.as_deref().unwrap_or(&config.launchers.editor),
-        &destination,
-        "editor",
-    );
-    launch_after_mutation(&config.launchers.terminal, &destination, "terminal");
+    launch_after_mutation(&config.launchers.editor, &destination, "editor");
+    launch_terminal_after_mutation(&config, &destination);
     Ok(())
 }
 
@@ -1723,6 +1841,25 @@ fn worktree_remove(name: &str, force: bool, yes: bool, paths: &Paths) -> Result<
         return Ok(());
     }
     let primary_name = worktree.template_name();
+    if !worktree.path.exists() {
+        config
+            .projects
+            .retain(|project| project.path != worktree.path);
+        config
+            .cached_projects
+            .retain(|project| project.path != worktree.path);
+        save_config(paths, &config).with_context(|| {
+            format!(
+                "worktree directory is already missing, but its devx registration could not be removed: {}",
+                worktree.path.display()
+            )
+        })?;
+        println!(
+            "Removed stale worktree registration {name}\n  Directory was already missing: {}",
+            worktree.path.display()
+        );
+        return Ok(());
+    }
     let primary = available
         .iter()
         .find(|project| project.name == primary_name && !project.is_worktree)
@@ -1762,8 +1899,9 @@ fn worktree_remove(name: &str, force: bool, yes: bool, paths: &Paths) -> Result<
                 &format!("Delete local branch '{branch}'? Remote branches are untouched"),
                 false,
             )? {
+                let deletion = if force { "-D" } else { "-d" };
                 let output = Command::new("git")
-                    .args(["branch", "-d", branch])
+                    .args(["branch", deletion, branch])
                     .current_dir(&primary.path)
                     .output()
                     .context("could not start git branch deletion")?;
@@ -1798,6 +1936,29 @@ fn launch_after_mutation(template: &[String], path: &Path, kind: &str) {
     }
 }
 
+fn launch_terminal_after_mutation(config: &Config, path: &Path) {
+    if config.workspace.enabled {
+        let project = Project {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "worktree".to_owned()),
+            path: path.to_owned(),
+            template_project: None,
+            branch: None,
+            is_worktree: true,
+        };
+        if let Err(error) = launch_workspace(config, &project) {
+            eprintln!(
+                "warning: terminal workspace launch failed after the mutation completed: {error}\n  Open manually: {}",
+                path.display()
+            );
+        }
+    } else {
+        launch_after_mutation(&config.launchers.terminal, path, "terminal");
+    }
+}
+
 fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
@@ -1813,6 +1974,11 @@ fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn launch_for_picker(config: &Config, project: &Project) -> Result<()> {
+    launch(&config.launchers.editor, &project.path, "editor")?;
+    launch_workspace(config, project)
 }
 
 fn workspace(args: WorkspaceArgs, paths: &Paths) -> Result<()> {
@@ -1843,7 +2009,10 @@ fn configure_workspace(config: &mut Config) -> Result<()> {
     }
     let current = config.workspace.vcs.join(" ");
     let command: String = Input::new()
-        .with_prompt("VCS command for the workspace")
+        .with_prompt(format!(
+            "VCS command for the workspace (current: {})",
+            config.workspace.vcs.join(" ")
+        ))
         .default(current)
         .interact_text()?;
     let command: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
@@ -1963,12 +2132,7 @@ fn config(command: ConfigCommand, paths: &Paths) -> Result<()> {
         ConfigCommand::List { project } => {
             let projects = available_projects(&app)?;
             let registered = get_project(&projects, &project)?;
-            let mut files: Vec<_> = app
-                .managed_files
-                .iter()
-                .filter(|file| file.project == registered.template_name())
-                .map(|file| file.destination.clone())
-                .collect();
+            let mut files = configured_overlay_destinations(paths, &app, registered)?;
             files.sort();
             if files.is_empty() {
                 println!(
@@ -1990,15 +2154,15 @@ fn config_search(paths: &Paths, project: &str, query: &str) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
     let registered = get_project(&projects, project)?;
-    let files: Vec<_> = config
-        .managed_files
-        .iter()
-        .filter(|file| file.project == registered.template_name())
-        .flat_map(|file| {
+    let files: Vec<_> = configured_overlay_destinations(paths, &config, registered)?
+        .into_iter()
+        .flat_map(|destination| {
             [
-                registered.path.join(&file.destination),
-                paths.global_overlays_dir().join(&file.destination),
-                paths.overlays_dir(&file.project).join(&file.destination),
+                registered.path.join(&destination),
+                paths.global_overlays_dir().join(&destination),
+                paths
+                    .overlays_dir(registered.template_name())
+                    .join(&destination),
             ]
         })
         .filter(|path| path.exists())
@@ -2036,28 +2200,25 @@ fn config_apply(paths: &Paths, project: &str) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
     let registered = get_project(&projects, project)?;
-    let managed: Vec<_> = config
-        .managed_files
-        .iter()
-        .filter(|file| file.project == registered.template_name())
-        .collect();
-    if managed.is_empty() {
+    let destinations = configured_overlay_destinations(paths, &config, registered)?;
+    if destinations.is_empty() {
         bail!(
-            "no overlay files configured for {}; run 'devx project setup {project}'",
-            registered.template_name()
+            "no global or project overlay files found for {project}; run 'devx config global-add' or 'devx project setup {project}'"
         );
     }
 
     let checkout_root = fs::canonicalize(&registered.path)
         .with_context(|| format!("cannot access checkout {}", registered.path.display()))?;
     let mut changes = Vec::new();
-    for file in managed {
-        let destination = registered.path.join(&file.destination);
+    for relative_path in destinations {
+        let destination = registered.path.join(&relative_path);
         ensure_within_checkout(&checkout_root, &destination, &registered.path)?;
         let old = fs::read_to_string(&destination)
             .with_context(|| format!("cannot read base configuration {}", destination.display()))?;
-        let global = paths.global_overlays_dir().join(&file.destination);
-        let project_overlay = paths.overlays_dir(&file.project).join(&file.destination);
+        let global = paths.global_overlays_dir().join(&relative_path);
+        let project_overlay = paths
+            .overlays_dir(registered.template_name())
+            .join(&relative_path);
         let new = merge_config_file(&destination, &old, &global, &project_overlay)?;
         if new != old {
             let diff = TextDiff::from_lines(&old, &new)
@@ -2096,6 +2257,90 @@ fn config_apply(paths: &Paths, project: &str) -> Result<()> {
     write_config_batch(&checkout_root, &registered.path, changes)?;
     println!("Applied {change_count} configuration change(s) for {project}.");
     Ok(())
+}
+
+fn copy_global_files(paths: &Paths, project: &str, files: &[PathBuf]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let config = load_config(paths)?;
+    let projects = available_projects(&config)?;
+    let checkout = get_project(&projects, project)?;
+    let mut copied = 0;
+    let mut skipped = 0;
+    for relative_path in files {
+        validate_relative(relative_path, "global copy file")?;
+        if is_under_src(relative_path) {
+            bail!(
+                "global copy file must be outside src: {}",
+                relative_path.display()
+            );
+        }
+        let source = paths.global_overlays_dir().join(relative_path);
+        let source_metadata = fs::symlink_metadata(&source)
+            .with_context(|| format!("cannot inspect global copy file {}", source.display()))?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
+            bail!(
+                "global copy source is not a regular file: {}",
+                source.display()
+            );
+        }
+        let destination = checkout.path.join(relative_path);
+        validate_path_components(&checkout.path, &destination, true, "global copy")?;
+        if destination.exists() {
+            skipped += 1;
+            continue;
+        }
+        let parent = destination
+            .parent()
+            .context("global copy destination has no parent")?;
+        fs::create_dir_all(parent)?;
+        validate_path_components(&checkout.path, &destination, true, "global copy")?;
+        if destination.exists() {
+            skipped += 1;
+            continue;
+        }
+        let temporary = temporary_path(&destination, "copy");
+        let result = (|| -> Result<()> {
+            let contents = fs::read(&source)
+                .with_context(|| format!("cannot read global copy file {}", source.display()))?;
+            create_temporary_file(&temporary, &contents)?;
+            fs::rename(&temporary, &destination)?;
+            sync_directory(parent)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            remove_file_report(&temporary);
+            return Err(error)
+                .with_context(|| format!("cannot copy global file {}", relative_path.display()));
+        }
+        copied += 1;
+    }
+    println!("Copied {copied} global file(s); skipped {skipped} existing file(s).");
+    Ok(())
+}
+
+fn configured_overlay_destinations(
+    paths: &Paths,
+    config: &Config,
+    project: &Project,
+) -> Result<Vec<PathBuf>> {
+    let mut destinations: BTreeSet<PathBuf> = config
+        .managed_files
+        .iter()
+        .filter(|file| file.project == project.template_name())
+        .map(|file| file.destination.clone())
+        .collect();
+    let global_directory = paths.global_overlays_dir();
+    if global_directory.is_dir() {
+        destinations.extend(discover_config_files(&global_directory)?);
+    }
+
+    // A global overlay is reusable, but only when the selected checkout has its base file.
+    Ok(destinations
+        .into_iter()
+        .filter(|destination| project.path.join(destination).is_file())
+        .collect())
 }
 
 fn ensure_within_checkout(checkout_root: &Path, destination: &Path, checkout: &Path) -> Result<()> {
@@ -2534,6 +2779,32 @@ fn discover_config_files(project: &Path) -> Result<Vec<PathBuf>> {
     collect_config_files(project, project, &mut files)?;
     files.sort();
     Ok(files)
+}
+
+fn discover_copy_files(global: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if global.is_dir() {
+        collect_copy_files(global, global, &mut files)?;
+    }
+    files.retain(|path| !is_under_src(path));
+    files.sort();
+    Ok(files)
+}
+
+fn collect_copy_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_copy_files(root, &path, files)?;
+        } else if path.is_file() {
+            files.push(path.strip_prefix(root)?.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn is_under_src(path: &Path) -> bool {
+    path.starts_with(Path::new("src"))
 }
 
 fn collect_config_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -3175,9 +3446,10 @@ fn update_primary_default_branch(repository: &Path, default_branch: &str) -> Res
         );
     }
     if is_dirty(repository) {
-        bail!(
-            "the primary checkout has uncommitted changes; commit, stash, or discard them before creating a worktree"
+        eprintln!(
+            "warning: the primary checkout has uncommitted changes; leaving it untouched and creating the worktree from origin/{default_branch}"
         );
+        return Ok(());
     }
     let remote_branch = format!("origin/{default_branch}");
     run_git(repository, ["merge", "--ff-only", &remote_branch])
@@ -3723,6 +3995,56 @@ mod tests {
     }
 
     #[test]
+    fn creates_worktree_when_primary_checkout_is_dirty() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let remote = directory.path().join("remote.git");
+        let clone = directory.path().join("clone");
+        let worktree = directory.path().join("worktree");
+        fs::create_dir(&source).unwrap();
+        run_git(&source, ["init", "--initial-branch", "main"]).unwrap();
+        run_git(&source, ["config", "user.email", "devx@example.test"]).unwrap();
+        run_git(&source, ["config", "user.name", "devx test"]).unwrap();
+        fs::write(source.join("README"), "test\n").unwrap();
+        run_git(&source, ["add", "README"]).unwrap();
+        run_git(&source, ["commit", "-m", "initial"]).unwrap();
+        run_git(&source, ["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        run_git(
+            &source,
+            ["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&source, ["push", "origin", "main"]).unwrap();
+        run_git(
+            &source,
+            ["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
+        )
+        .unwrap();
+
+        fs::write(clone.join("local-notes"), "keep me\n").unwrap();
+        update_primary_default_branch(&clone, "main").unwrap();
+
+        assert!(clone.join("local-notes").exists());
+        run_git(
+            &clone,
+            [
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+                "origin/main",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("README")).unwrap(),
+            "test\n"
+        );
+    }
+
+    #[test]
     fn worktree_name_replaces_branch_separators() {
         assert_eq!(
             default_worktree_name("api", "feature/login"),
@@ -3751,6 +4073,90 @@ mod tests {
         .unwrap();
         let names: Vec<_> = projects.into_iter().map(|project| project.name).collect();
         assert_eq!(names, ["dev-payments", "learning-payments"]);
+    }
+
+    #[test]
+    fn skips_stale_worktree_checkouts_during_discovery() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("dev");
+        let stale = root.join(".worktrees").join("api").join("Test-branch");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(
+            stale.join(".git"),
+            "gitdir: /missing/repository/.git/worktrees/Test-branch\n",
+        )
+        .unwrap();
+
+        let projects = discover_projects(&[ScanRoot {
+            name: "dev".into(),
+            path: root,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.path.clone())
+                .collect::<Vec<_>>(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn refresh_prunes_stale_registered_worktrees_but_keeps_repositories() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("dev");
+        let repository = root.join("api");
+        fs::create_dir_all(&repository).unwrap();
+        run_git(&repository, ["init", "--initial-branch", "main"]).unwrap();
+        fs::write(repository.join("README"), "test\n").unwrap();
+        run_git(&repository, ["add", "README"]).unwrap();
+        run_git(
+            &repository,
+            [
+                "-c",
+                "user.email=devx@example.test",
+                "-c",
+                "user.name=devx test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let repository = fs::canonicalize(repository).unwrap();
+        let stale = root.join(".worktrees/api/old");
+
+        let mut config = Config {
+            roots: vec![ScanRoot {
+                name: "dev".into(),
+                path: root,
+            }],
+            projects: vec![
+                Project {
+                    name: "api".into(),
+                    path: repository.clone(),
+                    template_project: None,
+                    branch: Some("main".into()),
+                    is_worktree: false,
+                },
+                Project {
+                    name: "api-old".into(),
+                    path: stale,
+                    template_project: Some("api".into()),
+                    branch: Some("old".into()),
+                    is_worktree: true,
+                },
+            ],
+            ..Config::default()
+        };
+
+        refresh_project_cache(&mut config).unwrap();
+
+        assert_eq!(config.projects.len(), 1);
+        assert_eq!(config.projects[0].name, "api");
+        assert!(config.cached_projects.is_empty());
     }
 
     #[test]
@@ -3856,6 +4262,63 @@ mod tests {
             .join("configs/api/src/main/resources/bootstrap.yml");
         create_empty_overlay(&overlay).unwrap();
         assert_eq!(fs::read_to_string(overlay).unwrap(), "");
+    }
+
+    #[test]
+    fn discovers_global_overlay_without_project_mapping() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("api");
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        fs::create_dir_all(checkout.join("config")).unwrap();
+        fs::write(checkout.join("config/app.yml"), "value: base\n").unwrap();
+        fs::create_dir_all(paths.global_overlays_dir()).unwrap();
+        fs::create_dir_all(paths.global_overlays_dir().join("config")).unwrap();
+        fs::write(
+            paths.global_overlays_dir().join("config/app.yml"),
+            "value: global\n",
+        )
+        .unwrap();
+        fs::write(
+            paths
+                .global_overlays_dir()
+                .join("config/not-in-checkout.yml"),
+            "value: unused\n",
+        )
+        .unwrap();
+
+        let project = Project {
+            name: "api".into(),
+            path: checkout,
+            template_project: None,
+            branch: None,
+            is_worktree: false,
+        };
+        let destinations =
+            configured_overlay_destinations(&paths, &Config::default(), &project).unwrap();
+
+        assert_eq!(destinations, vec![PathBuf::from("config/app.yml")]);
+    }
+
+    #[test]
+    fn discovers_global_copy_files_only_outside_src() {
+        let directory = tempdir().unwrap();
+        let global = directory.path().join("global");
+        fs::create_dir_all(global.join("src/main/resources")).unwrap();
+        fs::write(global.join("gradle.properties"), "local=true\n").unwrap();
+        fs::write(global.join("src/main/resources/app.yml"), "ignored\n").unwrap();
+        fs::write(global.join("settings.properties"), "local=true\n").unwrap();
+
+        assert_eq!(
+            discover_copy_files(&global).unwrap(),
+            vec![
+                PathBuf::from("gradle.properties"),
+                PathBuf::from("settings.properties")
+            ]
+        );
+        assert!(is_under_src(Path::new("src/main/resources/app.yml")));
+        assert!(!is_under_src(Path::new("src-backup/app.yml")));
     }
 
     #[test]

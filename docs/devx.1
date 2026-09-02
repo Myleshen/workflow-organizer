@@ -56,6 +56,11 @@ Raycast terminal applications without changing projects or overlays.
 .B devx launcher list
 Print the configured launcher commands.
 .TP
+.B devx edit
+Interactively edit the configured applications, workspace behavior, and scan
+roots. Existing values are shown or used as prompt defaults. Picker actions
+always open both configured application launchers.
+.TP
 .B devx reset
 After confirmation, remove all devx configuration and overlays. Repositories
 and Git worktrees are never changed. If installed, the Raycast script can also
@@ -116,11 +121,18 @@ the VCS command. Set [workspace].enabled = false in config.toml to disable it
 manually.
 .TP
 .B devx pick
-Use fzf to select and open checkouts, create worktrees, set up overlays, or
-apply overlays. Opening ranks repository groups by previous usage before fzf
-filters them. Pickers use compact tables with headers. Narrow terminals show
-name, branch, state, and checkout type; terminals at least 100 columns wide
-also show the home-relative path.
+Use fzf to select and open checkouts, clone a repository into a selected scan
+root, create worktrees, set up overlays, or apply overlays. Picker cloning asks
+for the Git URL and opens the new checkout in the configured editor and default
+workspace after the clone completes. Opening ranks repository groups by
+previous usage before fzf filters them. Pickers use compact tables with
+headers. Narrow terminals show name, branch, state, and checkout type;
+terminals at least 100 columns wide also show the home-relative path.
+.PP
+Picker opens and picker clones always launch both configured application
+launchers. Direct
+.B devx open
+continues to support --no-editor and --no-terminal.
 .SH WORKTREES
 .B devx worktree create PROJECT BRANCH [--name NAME]
 fetches origin, resolves its default branch, creates a new branch, and puts the
@@ -165,7 +177,10 @@ config_editor = ["open", "-a", "Zed", "{path}"]
 .TP
 .B devx config global-add
 Prompt for a supported project-relative filename and create an empty global
-overlay. A global overlay affects only projects mapped to that relative path.
+overlay. A global overlay affects every selected project with a base file at
+that relative path. Project-specific overlays are still configured through
+.B devx project setup
+and take precedence when present.
 .TP
 .B devx config list PROJECT
 List configuration files mapped for a project and its worktrees.

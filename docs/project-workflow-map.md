@@ -106,6 +106,7 @@ External executables include `git`, `fzf`, `rg`, `open`, `brew`, `man`, `tput`, 
 |---|---|
 | `devx init` | Create default configuration if absent |
 | `devx setup` | Configure applications and scan roots, refresh cache, optionally install Raycast |
+| `devx edit` | Interactively edit current applications, workspace, and scan roots |
 | `devx reset` | Confirm and remove devx configuration directory |
 | `devx man` | Write and display embedded man page |
 | `devx doctor` | Check commands, launchers, config, roots, and Raycast script |

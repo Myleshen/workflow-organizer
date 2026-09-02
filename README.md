@@ -37,6 +37,17 @@ devx launcher edit
 devx launcher list
 ```
 
+Edit all interactive settings using their current values as the starting point:
+
+```sh
+devx edit
+```
+
+This walks through the configured applications, workspace behavior, and
+additional scan roots. Picker actions always open both the configured editor and
+terminal; workspace behavior controls whether the terminal uses the configured
+workspace tool.
+
 To test another workflow from a clean slate, remove all devx configuration and
 overlays with a confirmation prompt. This never changes repositories or Git
 worktrees:
@@ -120,8 +131,10 @@ devx project clone dev git@github.com:org/my-service.git
 ```
 
 This creates `~/dev/my-service` and does not open applications afterward.
-Use `project add` only for a repository outside a scan root, or to assign an
-explicit alias.
+Use `devx pick` and choose **Clone repository** to select the scan root
+interactively, enter the Git URL, and open the new checkout in the configured
+editor and default workspace when cloning completes. Use `project add` only for
+a repository outside a scan root, or to assign an explicit alias.
 
 For a worktree registered manually rather than created by `devx`, map it to the
 primary project's overlays. The primary may be a scan-root-discovered project;
@@ -171,7 +184,8 @@ array, so alternatives such as `git gui` can be configured as
 `vcs = ["git", "gui"]`.
 
 Use `devx pick` to choose an action with `fzf`: open a registered checkout,
-create a worktree, set up configuration overlays, or apply them. The direct
+clone a repository, create a worktree, set up configuration overlays, or apply
+them. The direct
 commands remain available for scripting. The open picker lists the most
 recently/frequently opened projects first, then lets `fzf` fuzzy-filter them.
 Choose a project first, then choose its primary checkout or one of its
@@ -287,8 +301,10 @@ devx config global-add
 # Example input: src/main/resources/bootstrap.yml
 ```
 
-A global overlay applies only to projects that have mapped that same relative
-path through `project setup`.
+A global overlay is discovered by its relative path and applies to every
+selected project that has a matching base file. Project-specific overlays are
+still managed through `devx project setup` and are applied after the global
+overlay when both exist.
 
 Apply every mapped file to a checkout or worktree in one previewed batch:
 
@@ -309,6 +325,12 @@ This requires `rg` (`brew install ripgrep`) only for search.
 `config apply` merges `base project file < global overlay < project overlay`,
 prints every unified diff, and performs no writes unless a single confirmation
 is accepted. Relative paths cannot escape their configured roots.
+
+When applying configuration from `devx pick`, global files outside the `src`
+directory are offered separately for copying. Select files such as
+`gradle.properties` when prompted. They are copied into the selected checkout
+only when the destination does not already exist; existing files are preserved.
+Files under `src` remain overlay-managed and are not offered in this copy step.
 
 YAML overlays must use nested mappings, not dotted keys. Mappings merge
 recursively, scalars replace scalars, and lists replace lists. A mapping/list/
