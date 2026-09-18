@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub const CONFIG_FILE: &str = "config.toml";
+pub const CACHE_FILE: &str = "cache.toml";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
@@ -24,9 +25,10 @@ pub struct Config {
     #[serde(default)]
     pub managed_files: Vec<ManagedFile>,
     #[serde(default)]
+    #[serde(skip)]
     pub cached_projects: Vec<Project>,
-    #[serde(default)]
-    pub cache_initialized: bool,
+    #[serde(skip)]
+    pub metadata: HashMap<PathBuf, ProjectMetadata>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,13 +76,28 @@ pub struct Project {
     pub is_worktree: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProjectMetadata {
+    pub project: Project,
+    pub status: String,
+    pub status_checked_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Cache {
+    #[serde(default)]
+    pub projects: Vec<ProjectMetadata>,
+    #[serde(default)]
+    pub refreshed_at: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ManagedFile {
     pub project: String,
     pub destination: PathBuf,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Launchers {
     #[serde(default = "default_editor")]
     pub editor: Vec<String>,
@@ -90,6 +107,15 @@ pub struct Launchers {
     pub config_editor: Vec<String>,
     #[serde(default = "default_raycast_terminal")]
     pub raycast_terminal: Vec<String>,
+    #[serde(default = "default_profiles")]
+    pub profiles: Vec<LauncherProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LauncherProfile {
+    pub id: String,
+    pub name: String,
+    pub command: Vec<String>,
 }
 
 impl Default for Launchers {
@@ -99,8 +125,24 @@ impl Default for Launchers {
             terminal: default_terminal(),
             config_editor: default_config_editor(),
             raycast_terminal: default_raycast_terminal(),
+            profiles: default_profiles(),
         }
     }
+}
+
+fn default_profiles() -> Vec<LauncherProfile> {
+    vec![
+        LauncherProfile {
+            id: "intellij".into(),
+            name: "IntelliJ IDEA".into(),
+            command: default_editor(),
+        },
+        LauncherProfile {
+            id: "zed".into(),
+            name: "Zed".into(),
+            command: default_config_editor(),
+        },
+    ]
 }
 
 pub struct Paths {
@@ -120,6 +162,10 @@ impl Paths {
 
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join(CONFIG_FILE)
+    }
+
+    pub fn cache_file(&self) -> PathBuf {
+        self.config_dir.join(CACHE_FILE)
     }
 
     pub fn overlays_dir(&self, project: &str) -> PathBuf {

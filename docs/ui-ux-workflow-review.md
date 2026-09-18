@@ -331,7 +331,7 @@ This is a recommendation, not a recorded final decision.
 ### F-15: Avoid serial Git-status work on every picker render
 
 **Severity:** P2  
-**Evidence:** Source-confirmed in `select_project()` and `project_picker_entry()`.
+**Evidence:** Source-confirmed in `select_project_cached()` and `project_picker_entry_cached()`.
 
 **Problem:** Each row invokes `git status --porcelain` sequentially before `fzf` opens. Cost grows linearly and is dominated by slow repositories.
 

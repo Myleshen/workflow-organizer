@@ -43,10 +43,9 @@ Edit all interactive settings using their current values as the starting point:
 devx edit
 ```
 
-This walks through the configured applications, workspace behavior, and
-additional scan roots. Picker actions always open both the configured editor and
-terminal; workspace behavior controls whether the terminal uses the configured
-workspace tool.
+This walks through the configured applications, named launcher profiles,
+workspace behavior, and additional scan roots. `devx pick` asks which opening
+profile to use after you choose a project.
 
 To test another workflow from a clean slate, remove all devx configuration and
 overlays with a confirmation prompt. This never changes repositories or Git
@@ -144,19 +143,26 @@ use its `project list` name as the shared overlay owner:
 devx project set-template my-service-feature my-service
 ```
 
-`devx open` starts both configured launchers. Use `--no-editor` or
-`--no-terminal` to skip one for a particular invocation.
+`devx open` uses the `editor-terminal` profile by default. Choose an explicit
+profile for deterministic agent-friendly behavior:
+
+```sh
+devx open my-service --profile intellij
+devx open my-service --profile zed
+devx open my-service --profile terminal
+devx open my-service --profile workspace
+```
 
 ## Workspace Default
 
-`devx pick` opens the selected checkout in the default workspace: editor plus a
-terminal workspace with the configured VCS tool. The default is LazyGit. With
+`devx pick` asks which named profile should open the selected checkout. The
+built-in workspace profile uses the configured VCS tool; the default is LazyGit.
+With
 Ghostty, `devx` uses Ghostty's native macOS split: a shell on the left and
 LazyGit on the right. Other terminals use a tmux split only when `tmux` is
 installed and their launcher includes `{command}`; otherwise they open normally.
 
-Direct `devx open <name>` remains a normal editor-and-terminal open. Force a
-workspace explicitly with:
+Use the `workspace` profile when you want the VCS workspace explicitly:
 
 ```sh
 devx workspace my-service
@@ -196,7 +202,9 @@ the hidden selection identifier.
 
 ## Launchers
 
-`devx init` creates `~/.config/devx/config.toml`. Launchers are token arrays;
+`devx init` creates `~/.config/devx/config.toml`. Derived project and Git status
+metadata is stored separately in `~/.config/devx/cache.toml`; rebuild it with
+`devx project refresh`. Launchers are token arrays;
 `{path}` is replaced with the registered directory. The defaults open IntelliJ
 IDEA and Ghostty with `open`:
 
@@ -205,6 +213,21 @@ IDEA and Ghostty with `open`:
 editor = ["open", "-a", "IntelliJ IDEA", "{path}"]
 terminal = ["open", "-a", "Ghostty", "{path}"]
 config_editor = ["open", "-a", "Zed", "{path}"]
+```
+
+Named profiles have stable IDs for scripts and agents and friendly names for
+the interactive picker:
+
+```toml
+[[launchers.profiles]]
+id = "intellij"
+name = "IntelliJ IDEA"
+command = ["open", "-a", "IntelliJ IDEA", "{path}"]
+
+[[launchers.profiles]]
+id = "zed"
+name = "Zed"
+command = ["open", "-a", "Zed", "{path}"]
 ```
 
 Override the terminal command for another app when you are ready. For Terminal:
@@ -340,10 +363,9 @@ formatting are normalized after a successful semantic merge.
 
 `.properties` and `.env` overlays merge by key. Later layers replace earlier
 values, new keys are appended, and unchanged base lines and comments are kept.
-Duplicate keys in the base or either overlay are errors. `.properties` support
-is intentionally limited to one logical `key=value` or `key:value` entry per
-line; escaped separators, escaped keys, and line continuations are not yet
-supported.
+Duplicate keys in the base or either overlay are errors. `.properties` supports
+one logical `key=value` or `key:value` entry per line, including backslash
+continuations; escaped separators and escaped keys are not supported.
 
 Overlay replacement revalidates destination content, file identity, and path
 components after confirmation and before each replacement. It preserves Unix
@@ -369,5 +391,5 @@ This writes `devx-pick.sh` under
 directory in Raycast Settings, Extensions, Script Commands, Add Directory.
 Search for **Devx Pick**, then assign a Raycast hotkey. The script opens the
 cached `devx pick` flow using `[launchers].raycast_terminal` and runs the
-binary at `~/Scripts/devx`. Its default is Ghostty; change that launcher to use
+binary at `~/scripts/devx`. Its default is Ghostty; change that launcher to use
 another terminal.

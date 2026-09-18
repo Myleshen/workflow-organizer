@@ -50,8 +50,9 @@ devx project refresh
 .EE
 .TP
 .B devx launcher edit
-Interactively update the IDE/editor, terminal, configuration editor, and
-Raycast terminal applications without changing projects or overlays.
+Interactively update the IDE/editor, terminal, configuration editor, named
+launcher profiles, and Raycast terminal applications without changing projects
+or overlays.
 .TP
 .B devx launcher list
 Print the configured launcher commands.
@@ -59,7 +60,7 @@ Print the configured launcher commands.
 .B devx edit
 Interactively edit the configured applications, workspace behavior, and scan
 roots. Existing values are shown or used as prompt defaults. Picker actions
-always open both configured application launchers.
+    uses the named profile selected after a project is chosen.
 .TP
 .B devx reset
 After confirmation, remove all devx configuration and overlays. Repositories
@@ -106,8 +107,10 @@ Repositories are not deleted. Use --yes only for non-interactive automation.
 .B devx project clone ROOT URL
 Clone a repository beneath a named scan root without opening applications.
 .TP
-.B devx open NAME [--no-editor] [--no-terminal]
-Open a checkout in the configured editor and terminal.
+.B devx open NAME [--profile ID]
+Open a checkout with a named launcher profile or built-in target. The default is
+editor-terminal. Built-in targets include terminal, workspace, config-editor,
+editor-terminal, and editor-workspace.
 .TP
 .B devx workspace NAME
 Open the configured terminal workspace for a checkout. The default VCS tool is
@@ -115,7 +118,6 @@ LazyGit. On Ghostty, devx uses a native macOS split with the shell on the left
 and LazyGit on the right. Other terminals use tmux only when installed and the
 terminal launcher supports {command}; otherwise devx opens a normal terminal.
 .PP
-devx pick uses this workspace by default, while direct devx open remains normal.
 Run devx workspace --configure to interactively enable or disable it and set
 the VCS command. Set [workspace].enabled = false in config.toml to disable it
 manually.
@@ -127,12 +129,12 @@ for the Git URL and opens the new checkout in the configured editor and default
 workspace after the clone completes. Opening ranks repository groups by
 previous usage before fzf filters them. Pickers use compact tables with
 headers. Narrow terminals show name, branch, state, and checkout type;
-terminals at least 100 columns wide also show the home-relative path.
+terminals at least 100 columns wide also show the home-relative path. Project
+and Git status metadata is read from ~/.config/devx/cache.toml so the picker can
+open quickly; rebuild it with devx project refresh. A * marks stale status.
 .PP
-Picker opens and picker clones always launch both configured application
-launchers. Direct
-.B devx open
-continues to support --no-editor and --no-terminal.
+Named launcher profiles use stable IDs for scripts and friendly names in the
+interactive picker.
 .SH WORKTREES
 .B devx worktree create PROJECT BRANCH [--name NAME]
 fetches origin, resolves its default branch, creates a new branch, and puts the
@@ -202,8 +204,9 @@ comments are normalized after a semantic merge.
 .properties and .env overlays merge by key. Later layers replace earlier
 values, new keys are appended, and unchanged base lines and comments remain.
 Duplicate keys in any input fail before writes.
-.properties support is limited to one logical key=value or key:value entry per
-line; escaped separators, escaped keys, and line continuations are unsupported.
+.properties supports one logical key=value or key:value entry per line,
+including backslash continuations. Escaped separators and escaped keys are
+unsupported.
 .PP
 Before replacement, devx revalidates destination content, file identity, and
 path components. Atomic replacement preserves Unix permission bits but not
@@ -220,11 +223,21 @@ are token arrays; {path} is replaced safely with the project directory.
 editor = ["open", "-a", "IntelliJ IDEA", "{path}"]
 terminal = ["open", "-a", "Ghostty", "{path}"]
 .EE
+Named profiles use stable IDs for scripts and friendly names in the picker:
+.EX
+[[launchers.profiles]]
+id = "intellij"
+name = "IntelliJ IDEA"
+command = ["open", "-a", "IntelliJ IDEA", "{path}"]
+.EE
 .SH FILES
 .TP
 .I ~/.config/devx/config.toml
 Project registry, scan roots, usage history, launcher configuration, and
 managed overlay mappings.
+.TP
+.I ~/.config/devx/cache.toml
+Rebuildable discovered project, worktree, branch, and Git status metadata.
 .TP
 .I ~/.config/devx/configs/
 Global and project-specific overlay files.

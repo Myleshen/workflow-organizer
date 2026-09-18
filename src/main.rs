@@ -19,10 +19,12 @@ use similar::TextDiff;
 
 mod state;
 
-use state::{Config, Launchers, ManagedFile, Paths, Project, ScanRoot, Usage};
+use state::{
+    Cache, Config, Launchers, ManagedFile, Paths, Project, ProjectMetadata, ScanRoot, Usage,
+};
 
 #[derive(Parser)]
-#[command(about = "macOS project, worktree, and configuration helper")]
+#[command(about = "macOS project, worktree, and configuration helper", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -161,15 +163,9 @@ enum CompletionShell {
 #[derive(Args)]
 struct OpenArgs {
     name: String,
-    /// Do not open the configured editor.
-    #[arg(long)]
-    no_editor: bool,
-    /// Do not open the configured terminal.
-    #[arg(long)]
-    no_terminal: bool,
-    /// Use the configured terminal workspace instead of a normal terminal.
-    #[arg(long)]
-    workspace: bool,
+    /// Named launcher profile or built-in target: terminal, workspace, config-editor, editor-terminal, editor-workspace.
+    #[arg(long, default_value = "editor-terminal")]
+    profile: String,
 }
 
 #[derive(Args)]
@@ -335,6 +331,17 @@ fn doctor(paths: &Paths) -> Result<()> {
             }),
         &mut check,
     );
+    for profile in &config
+        .as_ref()
+        .map_or_else(Launchers::default, |config| config.launchers.clone())
+        .profiles
+    {
+        check_launcher(
+            &format!("profile {}", profile.id),
+            &profile.command,
+            &mut check,
+        );
+    }
     if config
         .as_ref()
         .is_none_or(|config| config.workspace.enabled)
@@ -438,7 +445,10 @@ fn shell_quote(value: &str) -> String {
 
 fn install_raycast_script() -> Result<()> {
     let script = raycast_script_path()?;
-    let root = raycast_scripts_root()?;
+    let root = raycast_script_path()?
+        .parent()
+        .context("Raycast script has no parent")?
+        .to_owned();
     let directory = script
         .parent()
         .context("Raycast script path has no parent")?;
@@ -543,7 +553,6 @@ fn pick(paths: &Paths) -> Result<()> {
             "Remove worktree".to_owned(),
             "Set up configuration overlays".to_owned(),
             "Apply configuration overlays".to_owned(),
-            "Refresh Worktrees".to_owned(),
         ],
     )?
     else {
@@ -557,7 +566,6 @@ fn pick(paths: &Paths) -> Result<()> {
         "Remove worktree" => pick_remove_worktree(paths),
         "Set up configuration overlays" => project_setup(None, paths),
         "Apply configuration overlays" => pick_config(paths),
-        "Refresh Worktrees" => pick_refresh(paths),
         _ => unreachable!("picker returned an unknown action"),
     }
 }
@@ -627,18 +635,6 @@ fn pick_clone(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn pick_refresh(paths: &Paths) -> Result<()> {
-    let mut config = load_config(paths)?;
-    refresh_project_cache(&mut config)?;
-    save_config(paths, &config)?;
-    println!(
-        "Refreshed project cache\n  {} project(s)",
-        config.cached_projects.len()
-    );
-    thread::sleep(Duration::from_secs(2)); // Give the user a moment to see the message before the
-    Ok(())
-}
-
 fn pick_open(paths: &Paths) -> Result<()> {
     let mut config = load_config(paths)?;
     let available = available_projects(&config)?;
@@ -666,12 +662,39 @@ fn pick_open(paths: &Paths) -> Result<()> {
         .context("selected project group is no longer available")?;
     let mut checkouts = group.projects.clone();
     checkouts.sort_by(|left, right| checkout_sort_key(left).cmp(&checkout_sort_key(right)));
-    let Some(name) = select_project("Choose a checkout", &checkouts)? else {
+    let Some(name) = select_project_cached("Choose a checkout", &checkouts, &config.metadata)?
+    else {
         return Ok(());
     };
     let project = get_project(&available, &name)?;
-    launch_for_picker(&config, project)?;
+    let profile = select_profile(&config.launchers)?;
+    launch_profile(&config, project, &profile)?;
+    refresh_project_status(&mut config, &project.path)?;
+    save_cache(paths, &config)?;
     record_open(&mut config, &name, paths)
+}
+
+fn select_profile(launchers: &Launchers) -> Result<String> {
+    validate_profiles(launchers)?;
+    let mut choices: Vec<_> = launchers
+        .profiles
+        .iter()
+        .map(|profile| format!("{}\t{}", profile.id, profile.name))
+        .collect();
+    choices.extend(
+        [
+            "terminal\tTerminal",
+            "workspace\tWorkspace + LazyGit",
+            "config-editor\tConfiguration editor",
+            "editor-terminal\tPrimary editor + terminal",
+            "editor-workspace\tPrimary editor + workspace",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    select_table("Choose an opening profile", "ID\tPROFILE", &choices)?
+        .map(|value| value.split('\t').next().unwrap_or(&value).to_owned())
+        .context("opening profile selection was cancelled")
 }
 
 struct ProjectGroup<'a> {
@@ -731,7 +754,12 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
         );
         return Ok(());
     }
-    let Some(project) = select_project("Choose a primary project", &primary_projects)? else {
+    let Some(project) = select_project_cached(
+        "Choose a primary project",
+        &primary_projects,
+        &config.metadata,
+    )?
+    else {
         return Ok(());
     };
     let branch: String = Input::new()
@@ -751,7 +779,9 @@ fn pick_remove_worktree(paths: &Paths) -> Result<()> {
         println!("No worktrees exist.");
         return Ok(());
     }
-    let Some(name) = select_project("Choose a worktree to remove", &worktrees)? else {
+    let Some(name) =
+        select_project_cached("Choose a worktree to remove", &worktrees, &config.metadata)?
+    else {
         return Ok(());
     };
     let selected = get_project(&available, &name)?;
@@ -799,7 +829,8 @@ fn pick_config(paths: &Paths) -> Result<()> {
         .context("selected project group is no longer available")?;
     let mut checkouts = group.projects.clone();
     checkouts.sort_by(|left, right| checkout_sort_key(left).cmp(&checkout_sort_key(right)));
-    let Some(project) = select_project("Choose a checkout", &checkouts)? else {
+    let Some(project) = select_project_cached("Choose a checkout", &checkouts, &config.metadata)?
+    else {
         return Ok(());
     };
     let selected_project = get_project(&available, &project)?;
@@ -871,7 +902,7 @@ fn setup(paths: &Paths) -> Result<()> {
         );
         return Err(error);
     }
-    save_config(paths, &config)?;
+    save_cache(paths, &config)?;
     println!(
         "Configured project cache\n  {} project(s)",
         config.cached_projects.len()
@@ -946,7 +977,10 @@ fn reset(paths: &Paths, yes: bool) -> Result<()> {
         println!("Removed devx configuration.");
     }
     let script = raycast_script_path()?;
-    let root = raycast_scripts_root()?;
+    let root = raycast_script_path()?
+        .parent()
+        .context("Raycast script has no parent")?
+        .to_owned();
     let metadata = match fs::symlink_metadata(&script) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1063,13 +1097,6 @@ fn confirm_destructive(prompt: &str, yes: bool) -> Result<bool> {
         .map_err(Into::into)
 }
 
-fn raycast_scripts_root() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
-            .join("Library/Application Support/Raycast/Script Commands"),
-    )
-}
-
 fn remove_empty_parent_directories(mut directory: Option<&Path>, boundary: &Path) {
     while let Some(path) = directory {
         if path == boundary || !path.starts_with(boundary) || fs::remove_dir(path).is_err() {
@@ -1117,7 +1144,16 @@ fn configure_launchers(config: &mut Config) -> Result<()> {
         &applications,
         &mut config.launchers.raycast_terminal,
         true,
-    )
+    )?;
+    for profile in &mut config.launchers.profiles {
+        choose_launcher(
+            &format!("named profile '{}'", profile.name),
+            &applications,
+            &mut profile.command,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn configure_roots(config: &mut Config) -> Result<()> {
@@ -1255,10 +1291,19 @@ fn print_launchers(launchers: &Launchers) {
     ] {
         println!("{role}\n  {}\n", launcher.join(" "));
     }
+    for profile in &launchers.profiles {
+        println!(
+            "profile {} ({})\n  {}\n",
+            profile.id,
+            profile.name,
+            profile.command.join(" ")
+        );
+    }
 }
 
 fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
     let mut config = load_config(paths)?;
+    validate_profiles(&config.launchers)?;
     match command {
         ProjectCommand::Add { path, name } => {
             let path = fs::canonicalize(&path)
@@ -1288,6 +1333,8 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
                 .projects
                 .sort_by(|left, right| left.name.cmp(&right.name));
             save_config(paths, &config)?;
+            refresh_project_cache(&mut config)?;
+            save_cache(paths, &config)?;
             println!("Registered {name}");
         }
         ProjectCommand::List => {
@@ -1320,8 +1367,20 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
                 println!("Project was not unregistered.");
                 return Ok(());
             }
+            let removed_path = config
+                .projects
+                .iter()
+                .find(|project| project.name == name)
+                .map(|project| project.path.clone());
             config.projects.retain(|project| project.name != name);
             save_config(paths, &config)?;
+            config
+                .cached_projects
+                .retain(|project| project.name != name);
+            if let Some(path) = removed_path {
+                config.metadata.remove(&path);
+            }
+            save_cache(paths, &config)?;
             println!("Unregistered {name}. Checkout files were not deleted.");
         }
         ProjectCommand::AddRoot { path, name } => {
@@ -1348,6 +1407,7 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
                 .roots
                 .sort_by(|left, right| left.name.cmp(&right.name));
             save_config(paths, &config)?;
+            save_cache(paths, &config)?;
             println!("Added scan root {name}");
         }
         ProjectCommand::RenameRoot { name, new_name } => {
@@ -1385,12 +1445,14 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
             config.roots.retain(|root| root.name != name);
             refresh_project_cache(&mut config)?;
             save_config(paths, &config)?;
+            save_cache(paths, &config)?;
             println!("Removed scan root {name}. Repositories were not deleted.");
         }
         ProjectCommand::Refresh => {
             println!("Scanning {} root(s)...", config.roots.len());
             refresh_project_cache(&mut config)?;
             save_config(paths, &config)?;
+            save_cache(paths, &config)?;
             println!(
                 "Refreshed {} cached project(s)",
                 config.cached_projects.len()
@@ -1402,6 +1464,7 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
             println!("Refreshing project cache...");
             refresh_project_cache(&mut config)?;
             save_config(paths, &config)?;
+            save_cache(paths, &config)?;
         }
         ProjectCommand::Setup { project } => return project_setup(project, paths),
         ProjectCommand::SetTemplate {
@@ -1425,6 +1488,30 @@ fn project(command: ProjectCommand, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+const BUILTIN_PROFILES: [&str; 5] = [
+    "terminal",
+    "workspace",
+    "config-editor",
+    "editor-terminal",
+    "editor-workspace",
+];
+
+fn validate_profiles(launchers: &Launchers) -> Result<()> {
+    let mut ids = HashSet::new();
+    for profile in &launchers.profiles {
+        if profile.id.trim().is_empty() || !ids.insert(profile.id.as_str()) {
+            bail!("launcher profile IDs must be unique and non-empty");
+        }
+        if BUILTIN_PROFILES.contains(&profile.id.as_str()) {
+            bail!("launcher profile ID '{}' is reserved", profile.id);
+        }
+        if profile.command.is_empty() {
+            bail!("launcher profile '{}' has an empty command", profile.id);
+        }
+    }
+    Ok(())
+}
+
 fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<PathBuf> {
     let root = config
         .roots
@@ -1438,7 +1525,7 @@ fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<PathBuf>
         bail!("destination already exists: {}", destination.display());
     }
     let destination = destination.to_string_lossy();
-    run_command("git", ["clone", url, &destination], None)?;
+    run_git_vec(&root.path, &["clone", url, &destination])?;
     println!("Cloned {repository_name}\n  {}", root.path.display());
     Ok(destination.into_owned().into())
 }
@@ -1466,6 +1553,25 @@ fn available_projects(config: &Config) -> Result<Vec<Project>> {
     let mut projects = config.projects.clone();
     projects.extend(config.cached_projects.clone());
     finalize_projects(projects)
+}
+
+fn refresh_project_status(config: &mut Config, path: &Path) -> Result<()> {
+    let project = config
+        .projects
+        .iter()
+        .chain(config.cached_projects.iter())
+        .find(|project| project.path == path)
+        .cloned()
+        .with_context(|| format!("project path is not cached: {}", path.display()))?;
+    config.metadata.insert(
+        path.to_owned(),
+        ProjectMetadata {
+            project,
+            status: if is_dirty(path) { "dirty" } else { "clean" }.into(),
+            status_checked_at: unix_timestamp()?,
+        },
+    );
+    Ok(())
 }
 
 fn project_name_available(config: &Config, name: &str) -> Result<bool> {
@@ -1496,7 +1602,31 @@ fn refresh_project_cache(config: &mut Config) -> Result<()> {
     config
         .cached_projects
         .sort_by(|left, right| left.name.cmp(&right.name));
-    config.cache_initialized = true;
+    let projects = config
+        .projects
+        .iter()
+        .chain(config.cached_projects.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let metadata: HashMap<_, _> = projects
+        .into_iter()
+        .map(|project| {
+            let status = if is_dirty(&project.path) {
+                "dirty"
+            } else {
+                "clean"
+            };
+            (
+                project.path.clone(),
+                ProjectMetadata {
+                    project,
+                    status: status.to_owned(),
+                    status_checked_at: unix_timestamp().unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    config.metadata = metadata;
     Ok(())
 }
 
@@ -1779,6 +1909,8 @@ fn worktree_create(
             residual.join(", ")
         );
     }
+    refresh_project_status(&mut config, &destination)?;
+    save_cache(paths, &config)?;
     println!(
         "Created and registered {worktree_name}\n  {}",
         destination.display()
@@ -1854,6 +1986,8 @@ fn worktree_remove(name: &str, force: bool, yes: bool, paths: &Paths) -> Result<
                 worktree.path.display()
             )
         })?;
+        config.metadata.remove(&worktree.path);
+        save_cache(paths, &config)?;
         println!(
             "Removed stale worktree registration {name}\n  Directory was already missing: {}",
             worktree.path.display()
@@ -1892,6 +2026,8 @@ fn worktree_remove(name: &str, force: bool, yes: bool, paths: &Paths) -> Result<
             worktree.path.display()
         );
     }
+    config.metadata.remove(&worktree.path);
+    save_cache(paths, &config)?;
     println!("Removed worktree {name}\n  {}", worktree.path.display());
     match &worktree.branch {
         Some(branch) if std::io::stdin().is_terminal() => {
@@ -1963,22 +2099,50 @@ fn open(args: OpenArgs, paths: &Paths) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
     let project = get_project(&projects, &args.name)?;
-    if !args.no_editor {
-        launch(&config.launchers.editor, &project.path, "editor")?;
-    }
-    if !args.no_terminal {
-        if args.workspace && config.workspace.enabled {
-            launch_workspace(&config, project)?;
-        } else {
-            launch(&config.launchers.terminal, &project.path, "terminal")?;
-        }
-    }
+    launch_profile(&config, project, &args.profile)?;
+    let mut config = config;
+    refresh_project_status(&mut config, &project.path)?;
+    save_cache(paths, &config)?;
     Ok(())
 }
 
-fn launch_for_picker(config: &Config, project: &Project) -> Result<()> {
-    launch(&config.launchers.editor, &project.path, "editor")?;
-    launch_workspace(config, project)
+fn launch_profile(config: &Config, project: &Project, profile_id: &str) -> Result<()> {
+    if let Some(profile) = config
+        .launchers
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    {
+        return launch(&profile.command, &project.path, &profile.name);
+    }
+    match profile_id {
+        "terminal" => launch(&config.launchers.terminal, &project.path, "terminal"),
+        "workspace" => launch_workspace(config, project),
+        "config-editor" => launch(
+            &config.launchers.config_editor,
+            &project.path,
+            "configuration editor",
+        ),
+        "editor-terminal" => {
+            launch(&config.launchers.editor, &project.path, "editor")?;
+            launch(&config.launchers.terminal, &project.path, "terminal")
+        }
+        "editor-workspace" => {
+            launch(&config.launchers.editor, &project.path, "editor")?;
+            launch_workspace(config, project)
+        }
+        _ => {
+            let valid = config
+                .launchers
+                .profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .chain(BUILTIN_PROFILES)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("unknown opening profile '{profile_id}'; choose one of: {valid}")
+        }
+    }
 }
 
 fn workspace(args: WorkspaceArgs, paths: &Paths) -> Result<()> {
@@ -2673,7 +2837,9 @@ fn project_setup(project: Option<String>, paths: &Paths) -> Result<()> {
                 .iter()
                 .filter(|project| project.template_project.is_none())
                 .collect();
-            let Some(project) = select_project("Choose a project", &projects)? else {
+            let Some(project) =
+                select_project_cached("Choose a project", &projects, &config.metadata)?
+            else {
                 return Ok(());
             };
             project
@@ -3101,6 +3267,7 @@ fn merge_key_values(
 struct KeyValueDocument {
     lines: Vec<String>,
     keys: HashMap<String, usize>,
+    key_ranges: HashMap<String, (usize, usize)>,
     values: HashMap<String, String>,
     key_order: Vec<String>,
     trailing_newline: bool,
@@ -3111,18 +3278,37 @@ impl KeyValueDocument {
         let mut document = Self {
             lines: content.lines().map(str::to_owned).collect(),
             keys: HashMap::new(),
+            key_ranges: HashMap::new(),
             values: HashMap::new(),
             key_order: Vec::new(),
             trailing_newline: content.ends_with('\n'),
         };
-        for (index, line) in document.lines.iter().enumerate() {
-            if let Some((key, value, _)) = parse_key_value(line, format, label)? {
-                if document.keys.insert(key.clone(), index).is_some() {
+        let mut index = 0;
+        while index < document.lines.len() {
+            let start = index;
+            let mut logical = document.lines[index].clone();
+            while matches!(format, KeyValueFormat::Properties)
+                && logical.trim_end().ends_with('\\')
+                && index + 1 < document.lines.len()
+            {
+                logical = logical
+                    .trim_end()
+                    .strip_suffix('\\')
+                    .expect("continuation marker is present")
+                    .to_owned();
+                index += 1;
+                logical.push_str(document.lines[index].trim_start());
+            }
+            if let Some((key, value)) = parse_key_value(&logical, format, label)? {
+                if document.keys.contains_key(&key) {
                     bail!("duplicate key '{key}' in {label}");
                 }
+                document.keys.insert(key.clone(), start);
+                document.key_ranges.insert(key.clone(), (start, index));
                 document.key_order.push(key.clone());
                 document.values.insert(key, value);
             }
+            index += 1;
         }
         Ok(document)
     }
@@ -3130,10 +3316,25 @@ impl KeyValueDocument {
     fn apply(&mut self, overlay: Self) {
         for key in overlay.key_order {
             let value = overlay.values[&key].clone();
-            if let Some(index) = self.keys.get(&key) {
-                self.lines[*index] = format!("{}={value}", key);
+            if let Some((start, end)) = self.key_ranges.get(&key).copied() {
+                self.lines.splice(start..=end, [format!("{key}={value}")]);
+                let removed = end - start;
+                for index in self.keys.values_mut() {
+                    if *index > end {
+                        *index -= removed;
+                    }
+                }
+                for (range_start, range_end) in self.key_ranges.values_mut() {
+                    if *range_start > end {
+                        *range_start -= removed;
+                        *range_end -= removed;
+                    }
+                }
+                self.key_ranges.insert(key.clone(), (start, start));
             } else {
                 self.keys.insert(key.clone(), self.lines.len());
+                self.key_ranges
+                    .insert(key.clone(), (self.lines.len(), self.lines.len()));
                 self.lines.push(format!("{key}={value}"));
             }
         }
@@ -3152,7 +3353,7 @@ fn parse_key_value(
     line: &str,
     format: KeyValueFormat,
     label: &str,
-) -> Result<Option<(String, String, usize)>> {
+) -> Result<Option<(String, String)>> {
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed.starts_with('#')
@@ -3172,7 +3373,6 @@ fn parse_key_value(
     Ok(Some((
         key.to_owned(),
         line[separator + 1..].trim().to_owned(),
-        separator,
     )))
 }
 
@@ -3189,7 +3389,11 @@ fn require_fzf() -> Result<()> {
     bail!("'devx pick' requires fzf; install it with 'brew install fzf'")
 }
 
-fn select_project(title: &str, projects: &[&Project]) -> Result<Option<String>> {
+fn select_project_cached(
+    title: &str,
+    projects: &[&Project],
+    metadata: &HashMap<PathBuf, ProjectMetadata>,
+) -> Result<Option<String>> {
     let wide = terminal_columns() >= 100;
     let header = if wide {
         "NAME\tBRANCH\tSTATE\tTYPE\tPATH"
@@ -3198,18 +3402,35 @@ fn select_project(title: &str, projects: &[&Project]) -> Result<Option<String>> 
     };
     let choices: Vec<_> = projects
         .iter()
-        .map(|project| project_picker_entry(project, wide))
+        .map(|project| project_picker_entry_cached(project, wide, metadata))
         .collect();
     select_table(title, header, &choices)
 }
 
-fn project_picker_entry(project: &&Project, wide: bool) -> String {
+fn project_picker_entry_cached(
+    project: &&Project,
+    wide: bool,
+    metadata: &HashMap<PathBuf, ProjectMetadata>,
+) -> String {
     let branch = project.branch.as_deref().unwrap_or("detached");
-    let state = if is_dirty(&project.path) {
-        "dirty"
-    } else {
-        "clean"
-    };
+    let state = metadata
+        .get(&project.path)
+        .map(|entry| {
+            if unix_timestamp()
+                .unwrap_or_default()
+                .saturating_sub(entry.status_checked_at)
+                > 300
+            {
+                match entry.status.as_str() {
+                    "clean" => "clean*",
+                    "dirty" => "dirty*",
+                    status => status,
+                }
+            } else {
+                entry.status.as_str()
+            }
+        })
+        .unwrap_or("stale");
     let kind = if project.is_worktree {
         "worktree"
     } else {
@@ -3264,15 +3485,10 @@ fn is_dirty(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn select_one(prompt: &str, choices: &[String]) -> Result<Option<String>> {
+fn select_fzf(prompt: &str, choices: &[String], args: &[String]) -> Result<Option<String>> {
     let mut child = Command::new("fzf")
-        .args([
-            "--prompt",
-            &format!("{prompt}> "),
-            "--height",
-            "~40%",
-            "--ignore-case",
-        ])
+        .args(["--prompt", &format!("{prompt}> ")])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -3294,45 +3510,39 @@ fn select_one(prompt: &str, choices: &[String]) -> Result<Option<String>> {
     Ok(Some(selection.trim_end().to_owned()))
 }
 
+fn select_one(prompt: &str, choices: &[String]) -> Result<Option<String>> {
+    select_fzf(
+        prompt,
+        choices,
+        &["--height".into(), "~40%".into(), "--ignore-case".into()],
+    )
+}
+
 fn select_table(prompt: &str, header: &str, rows: &[String]) -> Result<Option<String>> {
     if rows.is_empty() {
         return Ok(None);
     }
-    let mut child = Command::new("fzf")
-        .args([
-            "--prompt",
-            &format!("{prompt}> "),
-            "--height",
-            "~70%",
-            "--ignore-case",
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "2..",
-            "--header",
-            header,
-            "--tabstop",
-            "2",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("could not start fzf")?;
-    child
-        .stdin
-        .as_mut()
-        .context("could not open fzf input")?
-        .write_all(rows.join("\n").as_bytes())?;
-    let output = child.wait_with_output()?;
-    if output.status.code() == Some(130) || output.status.code() == Some(1) {
+    let selection = select_fzf(
+        prompt,
+        rows,
+        &[
+            "--height".into(),
+            "~70%".into(),
+            "--ignore-case".into(),
+            "--delimiter".into(),
+            "\t".into(),
+            "--with-nth".into(),
+            "2..".into(),
+            "--header".into(),
+            header.into(),
+            "--tabstop".into(),
+            "2".into(),
+        ],
+    )?;
+    let Some(selection) = selection else {
         return Ok(None);
-    }
-    if !output.status.success() {
-        bail!("fzf failed with status {}", output.status);
-    }
-    let selection = String::from_utf8(output.stdout).context("fzf returned non-UTF-8 output")?;
+    };
     Ok(selection
-        .trim_end()
         .split_once('\t')
         .map(|(identifier, _)| identifier.to_owned()))
 }
@@ -3352,35 +3562,18 @@ fn select_many(prompt: &str, choices: &[String]) -> Result<Vec<String>> {
     if choices.is_empty() {
         return Ok(Vec::new());
     }
-    let mut child = Command::new("fzf")
-        .args([
-            "--prompt",
-            &format!("{prompt}> "),
-            "--height",
-            "~70%",
-            "--multi",
-            "--ignore-case",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("could not start fzf")?;
-    let input = choices.join("\n");
-    child
-        .stdin
-        .as_mut()
-        .context("could not open fzf input")?
-        .write_all(input.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if output.status.code() == Some(130) || output.status.code() == Some(1) {
-        return Ok(Vec::new());
-    }
-    if !output.status.success() {
-        bail!("fzf failed with status {}", output.status);
-    }
-    String::from_utf8(output.stdout)
-        .context("fzf returned non-UTF-8 output")
-        .map(|selection| selection.lines().map(str::to_owned).collect())
+    Ok(select_fzf(
+        prompt,
+        choices,
+        &[
+            "--height".into(),
+            "~70%".into(),
+            "--multi".into(),
+            "--ignore-case".into(),
+        ],
+    )?
+    .map(|selection| selection.lines().map(str::to_owned).collect())
+    .unwrap_or_default())
 }
 
 fn launch(template: &[String], path: &Path, kind: &str) -> Result<()> {
@@ -3488,28 +3681,6 @@ fn run_git_vec(repository: &Path, arguments: &[&str]) -> Result<()> {
     );
 }
 
-fn run_command<const N: usize>(
-    program: &str,
-    arguments: [&str; N],
-    directory: Option<&Path>,
-) -> Result<()> {
-    let mut command = Command::new(program);
-    command.args(arguments);
-    if let Some(directory) = directory {
-        command.current_dir(directory);
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("could not start {program}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    bail!(
-        "{program} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-}
-
 fn git_output<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<String> {
     let output = Command::new("git")
         .args(arguments)
@@ -3553,6 +3724,24 @@ fn load_config(paths: &Paths) -> Result<Config> {
     }
     let mut config: Config = toml::from_str(&fs::read_to_string(&file)?)
         .with_context(|| format!("invalid configuration in {}", file.display()))?;
+    validate_profiles(&config.launchers)?;
+    let cache = load_cache(paths)?;
+    let registered_paths: HashSet<_> = config
+        .projects
+        .iter()
+        .map(|project| project.path.clone())
+        .collect();
+    config.cached_projects = cache
+        .projects
+        .iter()
+        .map(|entry| entry.project.clone())
+        .filter(|project| !registered_paths.contains(&project.path))
+        .collect();
+    config.metadata = cache
+        .projects
+        .into_iter()
+        .map(|entry| (entry.project.path.clone(), entry))
+        .collect();
     let legacy_raycast_terminal: Vec<String> = vec![
         "open".into(),
         "-a".into(),
@@ -3567,13 +3756,62 @@ fn load_config(paths: &Paths) -> Result<Config> {
     if launcher_migrated {
         config.launchers.raycast_terminal = default_raycast_terminal();
     }
-    if !config.cache_initialized {
+    if cache.refreshed_at == 0 {
         refresh_project_cache(&mut config)?;
-        save_config(paths, &config)?;
-    } else if launcher_migrated {
+        save_cache(paths, &config)?;
+    }
+    if launcher_migrated {
         save_config(paths, &config)?;
     }
     Ok(config)
+}
+
+fn load_cache(paths: &Paths) -> Result<Cache> {
+    let file = paths.cache_file();
+    if !file.exists() {
+        return Ok(Cache::default());
+    }
+    toml::from_str(&fs::read_to_string(&file)?)
+        .with_context(|| format!("invalid cache in {}", file.display()))
+}
+
+fn save_cache(paths: &Paths, config: &Config) -> Result<()> {
+    let projects = config
+        .projects
+        .iter()
+        .chain(config.cached_projects.iter())
+        .map(|project| {
+            config
+                .metadata
+                .get(&project.path)
+                .cloned()
+                .unwrap_or_else(|| ProjectMetadata {
+                    project: project.clone(),
+                    status: "unknown".into(),
+                    status_checked_at: 0,
+                })
+        })
+        .collect();
+    save_cache_file(
+        paths,
+        &Cache {
+            projects,
+            refreshed_at: unix_timestamp()?,
+        },
+    )
+}
+
+fn save_cache_file(paths: &Paths, cache: &Cache) -> Result<()> {
+    fs::create_dir_all(&paths.config_dir)?;
+    let destination = paths.cache_file();
+    let temporary = paths.config_dir.join(format!(
+        ".cache-{}-{}.tmp",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temporary, toml::to_string_pretty(cache)?)?;
+    fs::rename(&temporary, destination)?;
+    Ok(())
 }
 
 struct ConfigLock {
@@ -3687,7 +3925,7 @@ mod tests {
             workspace: Default::default(),
             managed_files: Vec::new(),
             cached_projects: Vec::new(),
-            cache_initialized: false,
+            metadata: HashMap::new(),
         };
         save_config(&paths, &config).unwrap();
         let loaded = load_config(&paths).unwrap();
@@ -3708,7 +3946,6 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(paths.config_file(), fs::Permissions::from_mode(0o600)).unwrap();
         let config = Config {
-            cache_initialized: true,
             ..Config::default()
         };
         save_config(&paths, &config).unwrap();
@@ -4248,6 +4485,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_properties_continuation_lines() {
+        let directory = tempdir().unwrap();
+        let global = directory.path().join("global.properties");
+        fs::write(&global, "new=value\n").unwrap();
+
+        let merged = merge_key_values(
+            "spring.autoconfigure.exclude=\\\n  first,\\\n  second\n",
+            &global,
+            &directory.path().join("missing.properties"),
+            KeyValueFormat::Properties,
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged,
+            "spring.autoconfigure.exclude=\\\n  first,\\\n  second\nnew=value\n"
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_key_value_entries() {
         let error = KeyValueDocument::parse("HOST=one\nHOST=two\n", KeyValueFormat::Env, "overlay")
             .unwrap_err();
@@ -4418,8 +4675,17 @@ mod tests {
             branch: Some("main".into()),
             is_worktree: false,
         };
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            project.path.clone(),
+            ProjectMetadata {
+                project: project.clone(),
+                status: "dirty".into(),
+                status_checked_at: unix_timestamp().unwrap(),
+            },
+        );
         assert_eq!(
-            project_picker_entry(&&project, false),
+            project_picker_entry_cached(&&project, false, &metadata),
             "api\tapi\tmain\tdirty\trepo"
         );
     }
@@ -4433,7 +4699,10 @@ mod tests {
             branch: Some("main".into()),
             is_worktree: false,
         };
-        assert!(project_picker_entry(&&project, true).ends_with("\t/Users/example/dev/api"));
+        assert!(
+            project_picker_entry_cached(&&project, true, &HashMap::new())
+                .ends_with("\t/Users/example/dev/api")
+        );
     }
 
     #[test]
@@ -4510,7 +4779,6 @@ mod tests {
             config_dir: directory.path().join("devx"),
         };
         let mut config = Config {
-            cache_initialized: true,
             ..Config::default()
         };
         config.launchers.raycast_terminal = vec![

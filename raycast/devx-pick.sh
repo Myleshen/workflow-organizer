@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-devx_path="$HOME/Scripts/devx"
+devx_path="$HOME/scripts/devx"
 if [[ ! -x "$devx_path" ]]; then
   print -u2 "devx is not installed at $devx_path"
   exit 1

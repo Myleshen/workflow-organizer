@@ -30,7 +30,7 @@ The worktree was already dirty when this review began. `README.md`, `docs/devx.1
 `devx` helps a local developer:
 
 1. Discover or explicitly register Git repositories and worktrees.
-2. Find and open a project in configured editor and terminal applications.
+2. Find and open a project with a selected named launcher profile or built-in target.
 3. Create and remove Git worktrees.
 4. Open an editor plus VCS-oriented terminal workspace.
 5. Maintain local global and project-specific configuration overlays outside repositories.
@@ -82,17 +82,17 @@ External executables include `git`, `fzf`, `rg`, `open`, `brew`, `man`, `tput`, 
 | `projects` | Explicitly registered repositories and worktrees |
 | `roots` | Directories recursively scanned for repositories |
 | `usage` | Picker open count and last-opened timestamp by project name |
-| `launchers` | Editor, terminal, config editor, and Raycast terminal token arrays |
+| `launchers` | Legacy roles, named launcher profiles, and Raycast terminal token arrays |
 | `workspace` | Whether picker opens use a workspace and which VCS command runs |
 | `managed_files` | Relative configuration paths associated with an overlay owner |
-| `cached_projects` | Repositories/worktrees found during the latest scan |
-| `cache_initialized` | Whether lazy migration/initial cache refresh has occurred |
+| `cached_projects` | In-memory view of repositories/worktrees loaded from `cache.toml` |
 
 `Paths::from_environment()` places state under `$XDG_CONFIG_HOME/devx`, or `~/.config/devx` when `XDG_CONFIG_HOME` is absent.
 
 ```text
 ~/.config/devx/
   config.toml
+  cache.toml
   configs/
     global/
       <relative managed path>
@@ -140,7 +140,7 @@ External executables include `git`, `fzf`, `rg`, `open`, `brew`, `man`, `tput`, 
 | Single picker | `select_one()` | `fzf`, 40% height, case-insensitive |
 | Table picker | `select_table()` | `fzf`, 70% height, hidden identifier column, header |
 | Multi picker | `select_many()` | `fzf --multi`, 40% height |
-| Project picker | `select_project()` | Branch, state, type, and optional path columns |
+| Project picker | `select_project_cached()` | Cached branch, state, type, and optional path columns |
 | Input | `dialoguer::Input` | Scan roots, names, branches, VCS command, overlay path |
 | Confirmation | `dialoguer::Confirm` | Used for reset, picker worktree removal, apply, and Raycast replacement |
 | Diff preview | `similar::TextDiff` | Unified diff printed directly to terminal |
@@ -192,7 +192,7 @@ Selections are not saved incrementally. A late scan failure can discard earlier 
 
 `discover_projects_in()` recursively walks every directory under each scan root until it finds a directory containing `.git`. It then stops descending into that checkout. `expand_worktrees()` invokes `git worktree list --porcelain`, gets branch information, and resolves naming collisions.
 
-Explicit projects and cached projects are combined on use. Duplicate names are rejected. `load_config()` may refresh and save the cache as a side effect when `cache_initialized` is false.
+Explicit projects and cached projects are combined on use. Duplicate names are rejected. `load_config()` may refresh and save the cache as a side effect when `cache.toml` has not been refreshed.
 
 ### Open picker
 
