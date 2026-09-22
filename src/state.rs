@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    default_config_editor, default_editor, default_raycast_terminal, default_terminal, default_vcs,
+    default_config_editor, default_editor, default_picker_profiles, default_raycast_terminal,
+    default_terminal, default_vcs,
 };
 
 pub const CONFIG_FILE: &str = "config.toml";
@@ -109,6 +110,8 @@ pub struct Launchers {
     pub raycast_terminal: Vec<String>,
     #[serde(default = "default_profiles")]
     pub profiles: Vec<LauncherProfile>,
+    #[serde(default = "default_picker_profiles")]
+    pub picker_profiles: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,6 +129,7 @@ impl Default for Launchers {
             config_editor: default_config_editor(),
             raycast_terminal: default_raycast_terminal(),
             profiles: default_profiles(),
+            picker_profiles: default_picker_profiles(),
         }
     }
 }

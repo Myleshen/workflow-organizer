@@ -26,6 +26,11 @@ editor, and Raycast terminal; prompts for one or more scan roots; refreshes the
 project cache; and can install the Raycast command. Selections are saved in
 `~/.config/devx/config.toml` for all later commands.
 
+`setup` also lets you choose the opening profiles shown by `devx pick`. The
+picker shows only this configured list; use `devx launcher edit` to change it.
+Built-in profiles are `terminal`, `workspace`, `config-editor`,
+`editor-terminal`, and `editor-workspace`.
+
 `setup` also prints optional Homebrew recommendations for the opinionated stack:
 Ghostty, Zed, and LazyGit. It does not install or require them. LazyGit becomes
 required only while the default workspace workflow is enabled.
@@ -143,14 +148,16 @@ use its `project list` name as the shared overlay owner:
 devx project set-template my-service-feature my-service
 ```
 
-`devx open` uses the `editor-terminal` profile by default. Choose an explicit
-profile for deterministic agent-friendly behavior:
+`devx open` uses the terminal-only profile by default, so automation does not
+open desktop editors. `devx pick` remains the human-assisted flow for choosing
+an editor profile. Choose an explicit profile when needed:
 
 ```sh
 devx open my-service --profile intellij
 devx open my-service --profile zed
 devx open my-service --profile terminal
 devx open my-service --profile workspace
+devx open my-service --profile editor-terminal
 ```
 
 ## Workspace Default
@@ -159,8 +166,16 @@ devx open my-service --profile workspace
 built-in workspace profile uses the configured VCS tool; the default is LazyGit.
 With
 Ghostty, `devx` uses Ghostty's native macOS split: a shell on the left and
-LazyGit on the right. Other terminals use a tmux split only when `tmux` is
-installed and their launcher includes `{command}`; otherwise they open normally.
+LazyGit on the right. The LazyGit pane starts through interactive login Zsh so
+tools configured in `~/.zshrc` are available. Other terminals use a tmux split
+only when `tmux` is installed and their launcher includes `{command}`; otherwise
+they open normally.
+
+For a custom terminal launcher, the program token must be an executable on the
+environment `PATH` that starts `devx`; use an absolute executable path when the
+command can be launched from GUI tools with a different environment. A tmux
+workspace launcher must pass `{command}` to the terminal's command-execution
+mode.
 
 Use the `workspace` profile when you want the VCS workspace explicitly:
 
@@ -230,6 +245,18 @@ name = "Zed"
 command = ["open", "-a", "Zed", "{path}"]
 ```
 
+Choose exactly which profiles appear in `devx pick` with
+`[launchers].picker_profiles`. The default keeps the common terminal,
+editor-plus-terminal, editor-plus-LazyGit, and configuration-editor options:
+
+```toml
+[launchers]
+picker_profiles = ["terminal", "editor-terminal", "editor-workspace", "config-editor"]
+```
+
+Add `intellij` or `zed` only when you want that named profile in the picker.
+Every entry must be a built-in profile or the ID of a configured named profile.
+
 Override the terminal command for another app when you are ready. For Terminal:
 
 ```toml
@@ -238,6 +265,9 @@ terminal = ["open", "-a", "Terminal", "{path}"]
 
 The command must be a token array rather than a shell string. This avoids shell
 escaping problems and allows paths containing spaces to be passed safely.
+
+Raycast launches the picker in an interactive login Zsh shell, so tools made
+available by your `~/.zshrc` are also available to `devx pick`.
 
 ## Worktree layout
 
@@ -334,6 +364,7 @@ Apply every mapped file to a checkout or worktree in one previewed batch:
 ```sh
 devx config list my-service
 devx config apply my-service
+devx config apply my-service --yes # for non-interactive automation
 ```
 
 Search the mapped base configuration and matching global/project overlays with
@@ -347,7 +378,8 @@ This requires `rg` (`brew install ripgrep`) only for search.
 
 `config apply` merges `base project file < global overlay < project overlay`,
 prints every unified diff, and performs no writes unless a single confirmation
-is accepted. Relative paths cannot escape their configured roots.
+is accepted. Non-interactive automation must pass `--yes`; it still prints the
+preview before applying. Relative paths cannot escape their configured roots.
 
 When applying configuration from `devx pick`, global files outside the `src`
 directory are offered separately for copying. Select files such as
@@ -391,5 +423,5 @@ This writes `devx-pick.sh` under
 directory in Raycast Settings, Extensions, Script Commands, Add Directory.
 Search for **Devx Pick**, then assign a Raycast hotkey. The script opens the
 cached `devx pick` flow using `[launchers].raycast_terminal` and runs the
-binary at `~/scripts/devx`. Its default is Ghostty; change that launcher to use
+binary at `~/Scripts/devx`. Its default is Ghostty; change that launcher to use
 another terminal.
