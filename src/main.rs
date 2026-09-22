@@ -163,8 +163,8 @@ enum CompletionShell {
 #[derive(Args)]
 struct OpenArgs {
     name: String,
-    /// Named launcher profile or built-in target: terminal, workspace, config-editor, editor-terminal, editor-workspace.
-    #[arg(long, default_value = "editor-terminal")]
+    /// Named launcher profile or built-in target: terminal, workspace, config-editor, editor-terminal, editor-workspace. Defaults to terminal for automation.
+    #[arg(long, default_value = "terminal")]
     profile: String,
 }
 
@@ -180,7 +180,12 @@ struct WorkspaceArgs {
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Preview and apply all configured overlays to a project or worktree.
-    Apply { project: String },
+    Apply {
+        project: String,
+        /// Confirm the previewed changes without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Print files configured for a project's overlay layers.
     List { project: String },
     /// Create an empty global overlay file and open the global overlay directory.
@@ -224,13 +229,22 @@ fn raycast_terminal_launcher(application: &str) -> Vec<String> {
         "--args".into(),
         "-e".into(),
         "zsh".into(),
-        "-lc".into(),
+        "-ilc".into(),
         "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status".into(),
     ]
 }
 
 fn default_vcs() -> Vec<String> {
     vec!["lazygit".into()]
+}
+
+fn default_picker_profiles() -> Vec<String> {
+    vec![
+        "terminal".into(),
+        "editor-terminal".into(),
+        "editor-workspace".into(),
+        "config-editor".into(),
+    ]
 }
 
 fn main() -> Result<()> {
@@ -675,23 +689,8 @@ fn pick_open(paths: &Paths) -> Result<()> {
 }
 
 fn select_profile(launchers: &Launchers) -> Result<String> {
-    validate_profiles(launchers)?;
-    let mut choices: Vec<_> = launchers
-        .profiles
-        .iter()
-        .map(|profile| format!("{}\t{}", profile.id, profile.name))
-        .collect();
-    choices.extend(
-        [
-            "terminal\tTerminal",
-            "workspace\tWorkspace + LazyGit",
-            "config-editor\tConfiguration editor",
-            "editor-terminal\tPrimary editor + terminal",
-            "editor-workspace\tPrimary editor + workspace",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    );
+    validate_picker_profiles(launchers)?;
+    let choices = profile_choices(launchers, &launchers.picker_profiles)?;
     select_table("Choose an opening profile", "ID\tPROFILE", &choices)?
         .map(|value| value.split('\t').next().unwrap_or(&value).to_owned())
         .context("opening profile selection was cancelled")
@@ -851,7 +850,7 @@ fn pick_config(paths: &Paths) -> Result<()> {
         .collect()
     };
     if !configured_overlay_destinations(paths, &config, selected_project)?.is_empty() {
-        config_apply(paths, &project)?;
+        config_apply(paths, &project, false)?;
     } else {
         println!("No overlay files configured for {project}; continuing with global copies.");
     }
@@ -1153,6 +1152,26 @@ fn configure_launchers(config: &mut Config) -> Result<()> {
             false,
         )?;
     }
+    configure_picker_profiles(&mut config.launchers)?;
+    Ok(())
+}
+
+fn configure_picker_profiles(launchers: &mut Launchers) -> Result<()> {
+    let choices = available_profile_ids(launchers)
+        .into_iter()
+        .map(|id| format!("{id}\t{}", profile_name(launchers, id).unwrap_or(id)))
+        .collect::<Vec<_>>();
+    let selected = select_many(
+        "Select opening profiles for devx pick (TAB selects, ENTER confirms)",
+        &choices,
+    )?;
+    if selected.is_empty() {
+        bail!("devx pick requires at least one opening profile");
+    }
+    launchers.picker_profiles = selected
+        .into_iter()
+        .map(|choice| choice.split('\t').next().unwrap_or(&choice).to_owned())
+        .collect();
     Ok(())
 }
 
@@ -1510,6 +1529,54 @@ fn validate_profiles(launchers: &Launchers) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_picker_profiles(launchers: &Launchers) -> Result<()> {
+    validate_profiles(launchers)?;
+    if launchers.picker_profiles.is_empty() {
+        bail!("devx pick requires at least one opening profile");
+    }
+    let available = available_profile_ids(launchers);
+    let mut ids = HashSet::new();
+    for id in &launchers.picker_profiles {
+        if !available.contains(&id.as_str()) || !ids.insert(id.as_str()) {
+            bail!("picker profiles must be unique configured or built-in profile IDs");
+        }
+    }
+    Ok(())
+}
+
+fn available_profile_ids(launchers: &Launchers) -> Vec<&str> {
+    BUILTIN_PROFILES
+        .into_iter()
+        .chain(launchers.profiles.iter().map(|profile| profile.id.as_str()))
+        .collect()
+}
+
+fn profile_name<'a>(launchers: &'a Launchers, id: &str) -> Option<&'a str> {
+    launchers
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .map(|profile| profile.name.as_str())
+        .or(match id {
+            "terminal" => Some("Terminal"),
+            "workspace" => Some("Workspace + LazyGit"),
+            "config-editor" => Some("Configuration editor"),
+            "editor-terminal" => Some("Primary editor + terminal"),
+            "editor-workspace" => Some("Primary editor + workspace"),
+            _ => None,
+        })
+}
+
+fn profile_choices(launchers: &Launchers, ids: &[String]) -> Result<Vec<String>> {
+    ids.iter()
+        .map(|id| {
+            profile_name(launchers, id)
+                .map(|name| format!("{id}\t{name}"))
+                .with_context(|| format!("unknown picker profile '{id}'"))
+        })
+        .collect()
 }
 
 fn clone_project(config: &Config, root_name: &str, url: &str) -> Result<PathBuf> {
@@ -2212,11 +2279,12 @@ fn launch_workspace(config: &Config, project: &Project) -> Result<()> {
         .vcs
         .first()
         .context("workspace VCS command is empty")?;
-    if !command_exists(vcs) {
+    let ghostty = launcher_application(&config.launchers.terminal) == Some("Ghostty");
+    if !ghostty && !command_exists(vcs) {
         println!("Workspace VCS is unavailable\n  {vcs}\n\nOpening a normal terminal instead.");
         return launch(&config.launchers.terminal, &project.path, "terminal");
     }
-    if launcher_application(&config.launchers.terminal) == Some("Ghostty") {
+    if ghostty {
         return launch_ghostty_workspace(&project.path, &vcs_command(&config.workspace.vcs));
     }
     if command_exists("tmux")
@@ -2246,7 +2314,7 @@ fn vcs_command(vcs: &[String]) -> String {
 }
 
 fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
-    let script = ghostty_workspace_script(path, vcs);
+    let script = ghostty_workspace_script(path, &ghostty_vcs_command(vcs));
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
@@ -2259,6 +2327,10 @@ fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn ghostty_vcs_command(vcs: &str) -> String {
+    format!("zsh -ilc {}", shell_quote(vcs))
 }
 
 fn ghostty_workspace_script(path: &Path, vcs: &str) -> String {
@@ -2291,7 +2363,7 @@ fn apple_script_quote(value: &str) -> String {
 fn config(command: ConfigCommand, paths: &Paths) -> Result<()> {
     let app = load_config(paths)?;
     match command {
-        ConfigCommand::Apply { project } => config_apply(paths, &project),
+        ConfigCommand::Apply { project, yes } => config_apply(paths, &project, yes),
         ConfigCommand::Search { project, query } => config_search(paths, &project, &query),
         ConfigCommand::List { project } => {
             let projects = available_projects(&app)?;
@@ -2360,7 +2432,7 @@ fn config_search(paths: &Paths, project: &str, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn config_apply(paths: &Paths, project: &str) -> Result<()> {
+fn config_apply(paths: &Paths, project: &str, yes: bool) -> Result<()> {
     let config = load_config(paths)?;
     let projects = available_projects(&config)?;
     let registered = get_project(&projects, project)?;
@@ -2409,11 +2481,10 @@ fn config_apply(paths: &Paths, project: &str) -> Result<()> {
     for change in &changes {
         print!("{}", change.diff);
     }
-    if !Confirm::new()
-        .with_prompt(format!("Apply {} configuration change(s)?", changes.len()))
-        .default(false)
-        .interact()?
-    {
+    if !confirm_destructive(
+        &format!("Apply {} configuration change(s)?", changes.len()),
+        yes,
+    )? {
         println!("No files changed.");
         return Ok(());
     }
@@ -3742,17 +3813,32 @@ fn load_config(paths: &Paths) -> Result<Config> {
         .into_iter()
         .map(|entry| (entry.project.path.clone(), entry))
         .collect();
-    let legacy_raycast_terminal: Vec<String> = vec![
-        "open".into(),
-        "-a".into(),
-        "Ghostty".into(),
-        "--args".into(),
-        "-e".into(),
-        "zsh".into(),
-        "-lc".into(),
-        "exec {command}".into(),
+    let legacy_raycast_terminals: [Vec<String>; 2] = [
+        vec![
+            "open".into(),
+            "-a".into(),
+            "Ghostty".into(),
+            "--args".into(),
+            "-e".into(),
+            "zsh".into(),
+            "-lc".into(),
+            "exec {command}".into(),
+        ],
+        vec![
+            "open".into(),
+            "-n".into(),
+            "-a".into(),
+            "Ghostty".into(),
+            "--args".into(),
+            "-e".into(),
+            "zsh".into(),
+            "-lc".into(),
+            "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status".into(),
+        ],
     ];
-    let launcher_migrated = config.launchers.raycast_terminal == legacy_raycast_terminal;
+    let launcher_migrated = legacy_raycast_terminals
+        .iter()
+        .any(|launcher| config.launchers.raycast_terminal == *launcher);
     if launcher_migrated {
         config.launchers.raycast_terminal = default_raycast_terminal();
     }
@@ -3897,6 +3983,44 @@ fn save_config(paths: &Paths, config: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn config_apply_accepts_noninteractive_confirmation() {
+        let cli = Cli::try_parse_from(["devx", "config", "apply", "api", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Config(ConfigCommand::Apply { project, yes: true }) if project == "api"
+        ));
+    }
+
+    #[test]
+    fn picker_uses_only_configured_profiles() {
+        let launchers = Launchers {
+            picker_profiles: vec!["terminal".into(), "zed".into()],
+            ..Launchers::default()
+        };
+
+        assert_eq!(
+            profile_choices(&launchers, &launchers.picker_profiles).unwrap(),
+            ["terminal\tTerminal", "zed\tZed"]
+        );
+        validate_picker_profiles(&launchers).unwrap();
+    }
+
+    #[test]
+    fn picker_rejects_unknown_or_duplicate_profiles() {
+        let launchers = Launchers {
+            picker_profiles: vec!["terminal".into(), "terminal".into()],
+            ..Launchers::default()
+        };
+        assert!(validate_picker_profiles(&launchers).is_err());
+
+        let launchers = Launchers {
+            picker_profiles: vec!["missing".into()],
+            ..Launchers::default()
+        };
+        assert!(validate_picker_profiles(&launchers).is_err());
+    }
 
     #[test]
     fn rejects_unsafe_relative_paths() {
@@ -4765,6 +4889,7 @@ mod tests {
         let launcher = default_raycast_terminal();
         let command = launcher.last().unwrap();
         assert_eq!(&launcher[..4], ["open", "-n", "-a", "Ghostty"]);
+        assert_eq!(launcher[7], "-ilc");
         assert_eq!(
             command,
             "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status"
@@ -4805,14 +4930,45 @@ mod tests {
     }
 
     #[test]
+    fn load_config_migrates_the_noninteractive_raycast_launcher() {
+        let directory = tempdir().unwrap();
+        let paths = Paths {
+            config_dir: directory.path().join("devx"),
+        };
+        let mut config = Config {
+            ..Config::default()
+        };
+        config.launchers.raycast_terminal = vec![
+            "open".into(),
+            "-n".into(),
+            "-a".into(),
+            "Ghostty".into(),
+            "--args".into(),
+            "-e".into(),
+            "zsh".into(),
+            "-lc".into(),
+            "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status".into(),
+        ];
+        save_config(&paths, &config).unwrap();
+
+        let loaded = load_config(&paths).unwrap();
+
+        assert_eq!(
+            loaded.launchers.raycast_terminal,
+            default_raycast_terminal()
+        );
+    }
+
+    #[test]
     fn quotes_vcs_tokens_for_workspace_shell_commands() {
         assert_eq!(vcs_command(&["git".into(), "gui".into()]), "'git' 'gui'");
     }
 
     #[test]
-    fn ghostty_workspace_does_not_prefix_the_vcs_command_with_exec() {
-        let script = ghostty_workspace_script(Path::new("/tmp/project"), "'lazygit'");
-        assert!(script.contains("command:\"'lazygit'\""));
-        assert!(!script.contains("command:\"exec "));
+    fn ghostty_workspace_uses_login_zsh_for_the_vcs_command() {
+        assert_eq!(
+            ghostty_vcs_command("'lazygit'"),
+            "zsh -ilc ''\\''lazygit'\\'''"
+        );
     }
 }

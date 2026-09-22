@@ -109,14 +109,21 @@ Clone a repository beneath a named scan root without opening applications.
 .TP
 .B devx open NAME [--profile ID]
 Open a checkout with a named launcher profile or built-in target. The default is
-editor-terminal. Built-in targets include terminal, workspace, config-editor,
+terminal, so automation does not open desktop editors. Use the interactive
+.B devx pick
+flow or select an editor profile explicitly. Built-in targets include terminal, workspace, config-editor,
 editor-terminal, and editor-workspace.
 .TP
 .B devx workspace NAME
 Open the configured terminal workspace for a checkout. The default VCS tool is
 LazyGit. On Ghostty, devx uses a native macOS split with the shell on the left
-and LazyGit on the right. Other terminals use tmux only when installed and the
+and LazyGit on the right through interactive login Zsh, including tools
+configured in ~/.zshrc. Other terminals use tmux only when installed and the
 terminal launcher supports {command}; otherwise devx opens a normal terminal.
+.PP
+Custom launcher program tokens must resolve from the environment PATH that
+starts devx. A tmux workspace launcher must pass {command} to the terminal's
+command-execution mode.
 .PP
 Run devx workspace --configure to interactively enable or disable it and set
 the VCS command. Set [workspace].enabled = false in config.toml to disable it
@@ -133,8 +140,11 @@ terminals at least 100 columns wide also show the home-relative path. Project
 and Git status metadata is read from ~/.config/devx/cache.toml so the picker can
 open quickly; rebuild it with devx project refresh. A * marks stale status.
 .PP
-Named launcher profiles use stable IDs for scripts and friendly names in the
-interactive picker.
+Named launcher profiles use stable IDs for scripts. The profiles shown by
+.B devx pick
+are configured with
+.B [launchers].picker_profiles;
+only listed built-in or named profile IDs appear in the picker.
 .SH WORKTREES
 .B devx worktree create PROJECT BRANCH [--name NAME]
 fetches origin, resolves its default branch, creates a new branch, and puts the
@@ -187,9 +197,10 @@ and take precedence when present.
 .B devx config list PROJECT
 List configuration files mapped for a project and its worktrees.
 .TP
-.B devx config apply PROJECT
+.B devx config apply PROJECT [--yes]
 Merge and preview all mapped files as one batch, then request one confirmation
-before writing any files.
+before writing any files. Non-interactive automation must pass --yes; the
+preview is still printed before files are written.
 .TP
 .B devx config search PROJECT QUERY
 Use case-insensitive ripgrep to search the mapped base files and matching global
@@ -251,5 +262,5 @@ for clap-generated command and option reference.
 Run devx raycast install to install a bundled Raycast Script Command under
 ~/Library/Application Support/Raycast/Script Commands/devx. Add that directory
 in Raycast Settings, Extensions, Script Commands, Add Directory, then assign
-Devx Pick a hotkey. It starts devx pick in Ghostty.
-The launcher is configurable with [launchers].raycast_terminal.
+Devx Pick a hotkey. It starts devx pick in Ghostty using an interactive login
+Zsh shell. The launcher is configurable with [launchers].raycast_terminal.
