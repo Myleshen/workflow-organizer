@@ -228,6 +228,10 @@ IDEA and Ghostty with `open`:
 editor = ["open", "-a", "IntelliJ IDEA", "{path}"]
 terminal = ["open", "-a", "Ghostty", "{path}"]
 config_editor = ["open", "-a", "Zed", "{path}"]
+
+# macOS Ghostty launches and workspaces use a new tab in the front Ghostty
+# window by default. Set this to false to use new windows instead.
+ghostty_tabs = true
 ```
 
 Named profiles have stable IDs for scripts and agents and friendly names for
@@ -294,7 +298,14 @@ registers the worktree. Its default registry name is `my-service-feature-login`;
 override it with `--name` when needed.
 
 After creation, `devx` opens the new worktree in the configured editor and
-terminal automatically.
+terminal automatically. Agents and other non-interactive callers can suppress
+both launchers:
+
+```sh
+devx worktree create my-service feature/login --no-editor --no-terminal
+```
+
+Use either flag independently to suppress only one launcher.
 
 Remove a worktree through the picker with `devx pick` and **Remove worktree**.
 Direct and picker removal both require confirmation. `--force` permits dirty

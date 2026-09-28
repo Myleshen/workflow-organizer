@@ -124,6 +124,12 @@ enum WorktreeCommand {
         /// Registry name. Defaults to <project>-<branch>.
         #[arg(long)]
         name: Option<String>,
+        /// Do not open the worktree in the configured editor.
+        #[arg(long)]
+        no_editor: bool,
+        /// Do not open the worktree in the configured terminal.
+        #[arg(long)]
+        no_terminal: bool,
     },
     /// Remove a registered worktree and its Git worktree directory.
     Remove {
@@ -446,6 +452,11 @@ fn raycast_pick() -> Result<()> {
     let config = load_config(&paths)?;
     let executable = env::current_exe().context("cannot determine the devx executable path")?;
     let command = format!("{} pick", shell_quote(&executable.to_string_lossy()));
+    if config.launchers.ghostty_tabs
+        && launcher_application(&config.launchers.raycast_terminal) == Some("Ghostty")
+    {
+        return launch_ghostty_command_tab(&format!("zsh -ilc {}", shell_quote(&command)));
+    }
     launch_command(
         &config.launchers.raycast_terminal,
         &command,
@@ -764,7 +775,7 @@ fn pick_worktree(paths: &Paths) -> Result<()> {
     let branch: String = Input::new()
         .with_prompt("New branch name")
         .interact_text()?;
-    worktree_create(project, branch, None, paths)
+    worktree_create(project, branch, None, false, false, paths)
 }
 
 fn pick_remove_worktree(paths: &Paths) -> Result<()> {
@@ -1899,7 +1910,9 @@ fn worktree(command: WorktreeCommand, paths: &Paths) -> Result<()> {
             project,
             branch,
             name,
-        } => worktree_create(project, branch, name, paths),
+            no_editor,
+            no_terminal,
+        } => worktree_create(project, branch, name, no_editor, no_terminal, paths),
         WorktreeCommand::Remove {
             project,
             force,
@@ -1912,6 +1925,8 @@ fn worktree_create(
     project: String,
     branch: String,
     name: Option<String>,
+    no_editor: bool,
+    no_terminal: bool,
     paths: &Paths,
 ) -> Result<()> {
     let mut config = load_config(paths)?;
@@ -1982,8 +1997,12 @@ fn worktree_create(
         "Created and registered {worktree_name}\n  {}",
         destination.display()
     );
-    launch_after_mutation(&config.launchers.editor, &destination, "editor");
-    launch_terminal_after_mutation(&config, &destination);
+    if !no_editor {
+        launch_after_mutation(&config.launchers.editor, &destination, "editor");
+    }
+    if !no_terminal {
+        launch_terminal_after_mutation(&config, &destination);
+    }
     Ok(())
 }
 
@@ -2183,7 +2202,7 @@ fn launch_profile(config: &Config, project: &Project, profile_id: &str) -> Resul
         return launch(&profile.command, &project.path, &profile.name);
     }
     match profile_id {
-        "terminal" => launch(&config.launchers.terminal, &project.path, "terminal"),
+        "terminal" => launch_terminal(config, &project.path),
         "workspace" => launch_workspace(config, project),
         "config-editor" => launch(
             &config.launchers.config_editor,
@@ -2192,7 +2211,7 @@ fn launch_profile(config: &Config, project: &Project, profile_id: &str) -> Resul
         ),
         "editor-terminal" => {
             launch(&config.launchers.editor, &project.path, "editor")?;
-            launch(&config.launchers.terminal, &project.path, "terminal")
+            launch_terminal(config, &project.path)
         }
         "editor-workspace" => {
             launch(&config.launchers.editor, &project.path, "editor")?;
@@ -2272,7 +2291,7 @@ fn configure_workspace(config: &mut Config) -> Result<()> {
 
 fn launch_workspace(config: &Config, project: &Project) -> Result<()> {
     if !config.workspace.enabled {
-        return launch(&config.launchers.terminal, &project.path, "terminal");
+        return launch_terminal(config, &project.path);
     }
     let vcs = config
         .workspace
@@ -2282,10 +2301,14 @@ fn launch_workspace(config: &Config, project: &Project) -> Result<()> {
     let ghostty = launcher_application(&config.launchers.terminal) == Some("Ghostty");
     if !ghostty && !command_exists(vcs) {
         println!("Workspace VCS is unavailable\n  {vcs}\n\nOpening a normal terminal instead.");
-        return launch(&config.launchers.terminal, &project.path, "terminal");
+        return launch_terminal(config, &project.path);
     }
     if ghostty {
-        return launch_ghostty_workspace(&project.path, &vcs_command(&config.workspace.vcs));
+        return launch_ghostty_workspace(
+            &project.path,
+            &vcs_command(&config.workspace.vcs),
+            config.launchers.ghostty_tabs,
+        );
     }
     if command_exists("tmux")
         && config
@@ -2303,7 +2326,68 @@ fn launch_workspace(config: &Config, project: &Project) -> Result<()> {
     println!(
         "Terminal workspace is unavailable\n  Configure a terminal launcher with {{command}} to use tmux.\n\nOpening a normal terminal instead."
     );
-    launch(&config.launchers.terminal, &project.path, "terminal")
+    launch_terminal(config, &project.path)
+}
+
+fn launch_terminal(config: &Config, path: &Path) -> Result<()> {
+    if config.launchers.ghostty_tabs
+        && launcher_application(&config.launchers.terminal) == Some("Ghostty")
+    {
+        return launch_ghostty_tab(path);
+    }
+    launch(&config.launchers.terminal, path, "terminal")
+}
+
+fn launch_ghostty_tab(path: &Path) -> Result<()> {
+    let working_directory = apple_script_quote(&path.to_string_lossy());
+    launch_ghostty_surface(
+        &format!("set initial working directory of config to {working_directory}"),
+        None,
+        "Ghostty tab",
+    )
+}
+
+fn launch_ghostty_command_tab(command: &str) -> Result<()> {
+    launch_ghostty_surface(
+        "set initial working directory of config to (POSIX path of (path to home folder))",
+        Some(command),
+        "Ghostty tab command",
+    )
+}
+
+fn launch_ghostty_surface(configuration: &str, command: Option<&str>, kind: &str) -> Result<()> {
+    let command_configuration = command
+        .map(|value| {
+            format!(
+                "\n           set command of config to {}",
+                apple_script_quote(value)
+            )
+        })
+        .unwrap_or_default();
+    let script = format!(
+        "tell application \"Ghostty\"\n\
+           set config to new surface configuration\n\
+           {configuration}{command_configuration}\n\
+           if (count of windows) > 0 then\n\
+             new tab in front window with configuration config\n\
+           else\n\
+             new window with configuration config\n\
+           end if\n\
+           activate\n\
+         end tell"
+    );
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .with_context(|| format!("could not start osascript for {kind}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "{kind} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
 }
 
 fn vcs_command(vcs: &[String]) -> String {
@@ -2313,8 +2397,8 @@ fn vcs_command(vcs: &[String]) -> String {
         .join(" ")
 }
 
-fn launch_ghostty_workspace(path: &Path, vcs: &str) -> Result<()> {
-    let script = ghostty_workspace_script(path, &ghostty_vcs_command(vcs));
+fn launch_ghostty_workspace(path: &Path, vcs: &str, use_tab: bool) -> Result<()> {
+    let script = ghostty_workspace_script(path, &ghostty_vcs_command(vcs), use_tab);
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
@@ -2333,14 +2417,30 @@ fn ghostty_vcs_command(vcs: &str) -> String {
     format!("zsh -ilc {}", shell_quote(vcs))
 }
 
-fn ghostty_workspace_script(path: &Path, vcs: &str) -> String {
+fn ghostty_workspace_script(path: &Path, vcs: &str, use_tab: bool) -> String {
     let working_directory = apple_script_quote(&path.to_string_lossy());
     let command = apple_script_quote(vcs);
+    let open_surface = if use_tab {
+        format!(
+            "if (count of windows) > 0 then\n\
+             set target_window to front window\n\
+             set initial to new tab in target_window with configuration initial_config\n\
+           else\n\
+             set target_window to new window with configuration initial_config\n\
+             set initial to selected tab of target_window\n\
+           end if"
+        )
+    } else {
+        "set target_window to new window with configuration initial_config\n\
+           set initial to selected tab of target_window"
+            .into()
+    };
     format!(
         "tell application \"Ghostty\"\n\
-           set config to new surface configuration\n\
-           set initial to new window with configuration {{initial working directory:{working_directory}}}\n\
-           split (focused terminal of selected tab of initial) direction right with configuration {{initial working directory:{working_directory}, command:{command}}}\n\
+           set initial_config to new surface configuration\n\
+           set initial working directory of initial_config to {working_directory}\n\
+           {open_surface}\n\
+           split (focused terminal of initial) direction right with configuration {{initial working directory:{working_directory}, command:{command}}}\n\
            activate\n\
          end tell"
     )
@@ -4970,5 +5070,21 @@ mod tests {
             ghostty_vcs_command("'lazygit'"),
             "zsh -ilc ''\\''lazygit'\\'''"
         );
+    }
+
+    #[test]
+    fn ghostty_workspace_uses_a_front_window_tab_by_default() {
+        let script =
+            ghostty_workspace_script(Path::new("/tmp/project"), "zsh -ilc 'lazygit'", true);
+        assert!(script.contains("new tab in target_window"));
+        assert!(script.contains("set target_window to front window"));
+    }
+
+    #[test]
+    fn ghostty_workspace_can_disable_tabs() {
+        let script =
+            ghostty_workspace_script(Path::new("/tmp/project"), "zsh -ilc 'lazygit'", false);
+        assert!(!script.contains("new tab in target_window"));
+        assert!(script.contains("new window with configuration"));
     }
 }

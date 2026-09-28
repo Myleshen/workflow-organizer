@@ -126,7 +126,7 @@ External executables include `git`, `fzf`, `rg`, `open`, `brew`, `man`, `tput`, 
 | `devx open NAME [flags]` | Open configured editor and/or terminal |
 | `devx workspace [NAME] [--configure]` | Configure or open terminal workspace |
 | `devx pick` | Select common actions through `fzf` |
-| `devx worktree create PROJECT BRANCH [--name]` | Fetch, create, register, and open worktree |
+| `devx worktree create PROJECT BRANCH [--name] [--no-editor] [--no-terminal]` | Fetch, create, register, and optionally open worktree |
 | `devx worktree remove PROJECT [--force]` | Remove Git worktree and registry/cache entry |
 | `devx config apply PROJECT` | Preview, confirm, and apply all overlay changes |
 | `devx config list PROJECT` | Print mapped configuration paths |

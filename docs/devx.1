@@ -146,7 +146,7 @@ are configured with
 .B [launchers].picker_profiles;
 only listed built-in or named profile IDs appear in the picker.
 .SH WORKTREES
-.B devx worktree create PROJECT BRANCH [--name NAME]
+.B devx worktree create PROJECT BRANCH [--name NAME] [--no-editor] [--no-terminal]
 fetches origin, resolves its default branch, creates a new branch, and puts the
 worktree under the scan-root sibling layout:
 .PP
@@ -157,6 +157,8 @@ worktree under the scan-root sibling layout:
 Existing worktrees are discovered with Git and are not moved. New worktrees
 share their primary project's configuration overlays and open in the configured
 editor and terminal after creation.
+.PP
+Use --no-editor and/or --no-terminal to suppress those launches for automation.
 .PP
 Use devx pick and choose Remove worktree for interactive removal. Direct and
 interactive removals require confirmation. --force allows dirty removal but does

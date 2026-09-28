@@ -108,6 +108,9 @@ pub struct Launchers {
     pub config_editor: Vec<String>,
     #[serde(default = "default_raycast_terminal")]
     pub raycast_terminal: Vec<String>,
+    /// Open Ghostty projects in a new tab in the front window when possible.
+    #[serde(default = "default_ghostty_tabs")]
+    pub ghostty_tabs: bool,
     #[serde(default = "default_profiles")]
     pub profiles: Vec<LauncherProfile>,
     #[serde(default = "default_picker_profiles")]
@@ -128,10 +131,15 @@ impl Default for Launchers {
             terminal: default_terminal(),
             config_editor: default_config_editor(),
             raycast_terminal: default_raycast_terminal(),
+            ghostty_tabs: default_ghostty_tabs(),
             profiles: default_profiles(),
             picker_profiles: default_picker_profiles(),
         }
     }
+}
+
+fn default_ghostty_tabs() -> bool {
+    true
 }
 
 fn default_profiles() -> Vec<LauncherProfile> {
