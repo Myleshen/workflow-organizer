@@ -2421,19 +2421,16 @@ fn ghostty_workspace_script(path: &Path, vcs: &str, use_tab: bool) -> String {
     let working_directory = apple_script_quote(&path.to_string_lossy());
     let command = apple_script_quote(vcs);
     let open_surface = if use_tab {
-        format!(
-            "if (count of windows) > 0 then\n\
+        "if (count of windows) > 0 then\n\
              set target_window to front window\n\
              set initial to new tab in target_window with configuration initial_config\n\
            else\n\
              set target_window to new window with configuration initial_config\n\
              set initial to selected tab of target_window\n\
            end if"
-        )
     } else {
         "set target_window to new window with configuration initial_config\n\
            set initial to selected tab of target_window"
-            .into()
     };
     format!(
         "tell application \"Ghostty\"\n\
@@ -3936,9 +3933,7 @@ fn load_config(paths: &Paths) -> Result<Config> {
             "{command}; status=$?; if (( status != 0 )); then print -u2 \"devx failed with status $status\"; read \"?Press Enter to close...\"; fi; exit $status".into(),
         ],
     ];
-    let launcher_migrated = legacy_raycast_terminals
-        .iter()
-        .any(|launcher| config.launchers.raycast_terminal == *launcher);
+    let launcher_migrated = legacy_raycast_terminals.contains(&config.launchers.raycast_terminal);
     if launcher_migrated {
         config.launchers.raycast_terminal = default_raycast_terminal();
     }

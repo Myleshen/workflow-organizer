@@ -3,12 +3,22 @@
 `devx` is a macOS command-line helper for opening registered Git projects and
 worktrees, and safely applying layered local configuration overlays.
 
-## Install and initialize
+## Install
+
+macOS only. The crate is published as `workflow-organizer`; the installed
+binary is `devx`.
 
 ```sh
-cargo install --path .
+cargo install workflow-organizer
 devx init
 ```
+
+From a checkout, use `cargo install --path .` instead.
+
+The defaults are opinionated: IntelliJ IDEA, Ghostty, and Zed are opened by
+`open -a`, and the `workspace` profile uses LazyGit. Nothing is installed for
+you, and every default is changeable in `~/.config/devx/config.toml` or through
+`devx setup`.
 
 By default, configuration is written to `~/.config/devx`. Set
 `XDG_CONFIG_HOME` to use a different base directory.

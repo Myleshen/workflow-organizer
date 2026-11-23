@@ -1,7 +1,19 @@
 [package]
-name = "devx"
-version = "0.1.2"
+name = "workflow-organizer"
+version = "0.2.0"
 edition = "2024"
+description = "macOS-only CLI for opening registered Git projects and worktrees, and applying layered config overlays"
+license = "MIT"
+repository = "https://github.com/Myleshen/workflow-organizer"
+homepage = "https://github.com/Myleshen/workflow-organizer"
+readme = "README.md"
+authors = ["Myleshen"]
+keywords = ["git", "worktree", "projects", "launcher", "macos"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "devx"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
