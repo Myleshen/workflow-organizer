@@ -4427,7 +4427,17 @@ mod tests {
         fs::write(source.join("README"), "test\n").unwrap();
         run_git(&source, ["add", "README"]).unwrap();
         run_git(&source, ["commit", "-m", "initial"]).unwrap();
-        run_git(&source, ["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        run_git(
+            &source,
+            [
+                "init",
+                "--bare",
+                "--initial-branch",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
         run_git(
             &source,
             ["remote", "add", "origin", remote.to_str().unwrap()],
@@ -4464,7 +4474,17 @@ mod tests {
         fs::write(source.join("README"), "test\n").unwrap();
         run_git(&source, ["add", "README"]).unwrap();
         run_git(&source, ["commit", "-m", "initial"]).unwrap();
-        run_git(&source, ["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        run_git(
+            &source,
+            [
+                "init",
+                "--bare",
+                "--initial-branch",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
         run_git(
             &source,
             ["remote", "add", "origin", remote.to_str().unwrap()],
