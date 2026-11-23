@@ -5,15 +5,23 @@ worktrees, and safely applying layered local configuration overlays.
 
 ## Install
 
-macOS only. The crate is published as `workflow-organizer`; the installed
-binary is `devx`.
+macOS only, Apple Silicon and Intel. Download the tarball for your machine from
+[GitHub Releases](https://github.com/Myleshen/workflow-organizer/releases), and
+put the `devx` binary it contains on your `PATH`:
 
 ```sh
-cargo install workflow-organizer
+mkdir devx-download && cd devx-download
+# Apple Silicon; use 'devx-*-macos-x86_64.tar.gz' on Intel
+gh release download --repo Myleshen/workflow-organizer \
+  --pattern 'devx-*-macos-arm64.tar.gz' --pattern SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf devx-*-macos-arm64.tar.gz
+sudo install -m 0755 devx-*/devx /usr/local/bin/devx
 devx init
 ```
 
-From a checkout, use `cargo install --path .` instead.
+Install from source instead with
+`cargo install --git https://github.com/Myleshen/workflow-organizer --bin devx`.
 
 The defaults are opinionated: IntelliJ IDEA, Ghostty, and Zed are opened by
 `open -a`, and the `workspace` profile uses LazyGit. Nothing is installed for
